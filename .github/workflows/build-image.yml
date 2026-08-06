@@ -1,0 +1,62 @@
+name: Build SD Card Image (patched fork)
+
+# Builds a bootable SeedSigner OS image from THIS repo's dev branch, instead
+# of the official upstream source. Manual only -- this is a fork-specific
+# convenience workflow, not part of upstream's own build/release pipeline.
+on:
+  workflow_dispatch:
+    inputs:
+      board_type:
+        description: Target board
+        type: choice
+        default: pi0
+        required: true
+        options:
+          - pi0
+          - pi02w
+          - pi2
+          - pi4
+
+permissions:
+  contents: read
+
+jobs:
+  build-image:
+    name: build image (${{ github.event.inputs.board_type }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      # GitHub-hosted ubuntu-latest runners only have ~14GB free by default;
+      # the buildroot-based OS build needs 20-30GB. Clear space that this
+      # job never touches before it runs.
+      - name: free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          docker image prune -f
+          df -h
+
+      - name: checkout seedsigner-os
+        run: |
+          git clone --recursive https://github.com/SeedSigner/seedsigner-os.git seedsigner-os
+
+      - name: build image
+        working-directory: seedsigner-os
+        env:
+          DOCKER_DEFAULT_PLATFORM: linux/amd64
+          BOARD_TYPE: ${{ github.event.inputs.board_type }}
+        run: |
+          SS_ARGS="--${BOARD_TYPE} --app-repo=https://github.com/${{ github.repository }}.git --app-branch=dev" \
+            docker compose up --force-recreate --build
+
+      - name: list image
+        run: ls -la seedsigner-os/images
+
+      - name: upload image
+        uses: actions/upload-artifact@v4
+        with:
+          name: seedsigner-image
+          path: seedsigner-os/images/*.img
+          if-no-files-found: error
+          retention-days: 14

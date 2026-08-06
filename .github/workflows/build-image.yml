@@ -1,9 +1,12 @@
 name: Build SD Card Image (patched fork)
 
 # Builds a bootable SeedSigner OS image from THIS repo's dev branch, instead
-# of the official upstream source. Manual only -- this is a fork-specific
-# convenience workflow, not part of upstream's own build/release pipeline.
+# of the official upstream source. Runs automatically on every push to dev
+# (always as pi0), or manually via workflow_dispatch for any board type.
 on:
+  push:
+    branches:
+      - dev
   workflow_dispatch:
     inputs:
       board_type:
@@ -22,7 +25,7 @@ permissions:
 
 jobs:
   build-image:
-    name: build image (${{ github.event.inputs.board_type }})
+    name: build image (${{ github.event.inputs.board_type || 'pi0' }})
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -45,7 +48,7 @@ jobs:
         working-directory: seedsigner-os
         env:
           DOCKER_DEFAULT_PLATFORM: linux/amd64
-          BOARD_TYPE: ${{ github.event.inputs.board_type }}
+          BOARD_TYPE: ${{ github.event.inputs.board_type || 'pi0' }}
         run: |
           SS_ARGS="--${BOARD_TYPE} --app-repo=https://github.com/${{ github.repository }}.git --app-branch=dev" \
             docker compose up --force-recreate --build

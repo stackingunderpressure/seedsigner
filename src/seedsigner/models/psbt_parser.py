@@ -1,10 +1,11 @@
 import logging
 from binascii import hexlify
-from embit import psbt, script, ec, bip32
+from embit import psbt, script, ec, bip32, compact, hashes
 from embit.descriptor import Descriptor
 from embit.networks import NETWORKS
 from embit.psbt import PSBT, DerivationPath, InputScope, OutputScope
 from embit.ec import PublicKey
+from embit.util import secp256k1
 from io import BytesIO
 from typing import List
 
@@ -173,16 +174,59 @@ class PSBTParser():
 
                 elif "p2tr" in self.policy["type"]:
                     my_pubkey = None
-                    # should have one or zero derivations for single-key addresses
-                    if len(out.taproot_bip32_derivations.values()) > 0:
-                        # TODO: Support keys in taptree leaves
-                        leaf_hashes, derivation = list(out.taproot_bip32_derivations.values())[0]
-                        der = derivation.derivation
-                        my_pubkey = self.root.derive(der)
-                        sc = script.p2tr(my_pubkey)
 
-                    if sc.data == self.psbt.tx.vout[i].script_pubkey.data:
-                        is_change = True
+                    # Full multi-leaf tree verification, when the PSBT
+                    # supplies BIP371's PSBT_OUT_TAP_TREE (key type
+                    # 0x06). This is a genuine cryptographic check, not a
+                    # trust-the-claim shortcut: the internal key + tree
+                    # are independently tweaked and compared byte-for-
+                    # byte against the REAL output scriptPubkey
+                    # (immutable, baked into the unsigned tx being
+                    # signed) -- a forged tree cannot produce a match
+                    # without also being the genuine preimage of that
+                    # exact address. Only once that matches does any
+                    # claimed signer key get weight, and only after
+                    # re-deriving it from OUR OWN seed (never trusting
+                    # the PSBT's claimed pubkey) and confirming it
+                    # actually appears in the specific real leaf script
+                    # the verified tree says it belongs to.
+                    tap_tree_raw = out.unknown.get(b"\x06")
+                    if tap_tree_raw is not None and out.taproot_internal_key is not None:
+                        try:
+                            leaves = PSBTParser._parse_tap_tree(tap_tree_raw)
+                            merkle_root, real_leaf_hashes = PSBTParser._tap_tree_merkle_root(leaves)
+                            internal_xonly = out.taproot_internal_key.xonly()
+                            output_xonly = PSBTParser._tap_tweak_xonly(internal_xonly, merkle_root)
+                            real_output_script = b"\x51\x20" + output_xonly
+                            if real_output_script == self.psbt.tx.vout[i].script_pubkey.data:
+                                for pub, (claimed_leaves, derivation) in out.taproot_bip32_derivations.items():
+                                    candidate = self.root.derive(derivation.derivation)
+                                    candidate_xonly = candidate.to_public().xonly()
+                                    if candidate_xonly != pub.xonly():
+                                        continue  # claimed key doesn't actually derive from our seed
+                                    for (depth, leaf_version, leaf_sc), leaf_hash in zip(leaves, real_leaf_hashes):
+                                        if leaf_hash in claimed_leaves and candidate_xonly in leaf_sc.data:
+                                            is_change = True
+                                            break
+                                    if is_change:
+                                        break
+                        except Exception:
+                            # Malformed tap_tree -- fail closed, fall through
+                            # to the single-key check below rather than
+                            # crashing the whole parse.
+                            logger.info("Could not verify PSBT_OUT_TAP_TREE for output %s", i)
+
+                    if not is_change:
+                        # Single-key key-path fallback: plain taproot
+                        # wallets, or an output with no tap_tree metadata.
+                        if len(out.taproot_bip32_derivations.values()) > 0:
+                            leaf_hashes, derivation = list(out.taproot_bip32_derivations.values())[0]
+                            der = derivation.derivation
+                            my_pubkey = self.root.derive(der)
+                            sc = script.p2tr(my_pubkey)
+
+                        if sc.data == self.psbt.tx.vout[i].script_pubkey.data:
+                            is_change = True
 
                 if sc.data == self.psbt.tx.vout[i].script_pubkey.data:
                     is_change = True
@@ -269,6 +313,81 @@ class PSBTParser():
                 cnt += len(list(inp.partial_sigs.keys()))
 
         return cnt
+
+
+    @staticmethod
+    def _parse_tap_tree(raw: bytes):
+        """
+            Parses BIP371's PSBT_OUT_TAP_TREE value (key type 0x06): a
+            sequence of (depth, leaf_version, script) tuples describing
+            every leaf of a taproot output's script tree, in the
+            canonical DFS order needed to rebuild its merkle root.
+
+            embit's OutputScope (this repo's pinned 0.8.0) has no special
+            handling for this key -- it lands verbatim in an output's
+            `unknown` dict, keyed by the raw 1-byte key b"\\x06". This
+            parses those raw bytes directly; no embit change is needed
+            for the parsing itself, only for using it below.
+
+            Returns a list of (depth: int, leaf_version: int,
+            script: embit.script.Script).
+        """
+        leaves = []
+        s = BytesIO(raw)
+        total = len(raw)
+        while s.tell() < total:
+            depth = s.read(1)[0]
+            leaf_version = s.read(1)[0]
+            script_len = compact.read_from(s)
+            leaves.append((depth, leaf_version, script.Script(s.read(script_len))))
+        return leaves
+
+
+    @staticmethod
+    def _tap_tree_merkle_root(leaves):
+        """
+            Rebuilds a taproot merkle root from a depth-ordered leaf list
+            (as returned by _parse_tap_tree), per BIP371's reconstruction
+            algorithm: push each leaf's TapLeaf hash at its stated depth,
+            then repeatedly combine the top two stack entries into a
+            TapBranch hash (BIP341: the pair sorted ascending before
+            hashing) whenever they share a depth, reducing the stack by
+            one level each time. A well-formed tree reduces to exactly
+            one (depth 0) entry -- the merkle root.
+
+            Returns (merkle_root: bytes, leaf_hashes: list[bytes] --
+            one per input leaf, in the same order as `leaves`).
+        """
+        stack = []  # list of (depth, hash)
+        leaf_hashes = []
+        for depth, leaf_version, sc in leaves:
+            leaf_hash = hashes.tagged_hash("TapLeaf", bytes([leaf_version]) + sc.serialize())
+            leaf_hashes.append(leaf_hash)
+            stack.append((depth, leaf_hash))
+            while len(stack) >= 2 and stack[-1][0] == stack[-2][0]:
+                d, h2 = stack.pop()
+                _, h1 = stack.pop()
+                branch = hashes.tagged_hash("TapBranch", (h1 + h2) if h1 <= h2 else (h2 + h1))
+                stack.append((d - 1, branch))
+        if len(stack) != 1:
+            raise ValueError("Malformed tap_tree: leaves did not reduce to a single root")
+        return stack[0][1], leaf_hashes
+
+
+    @staticmethod
+    def _tap_tweak_xonly(internal_xonly: bytes, merkle_root: bytes) -> bytes:
+        """
+            BIP341's output-key tweak: tweaked_key = internal_key +
+            tagged_hash("TapTweak", internal_key || merkle_root) * G,
+            returned as the resulting 32-byte x-only pubkey. Uses only
+            embit's already-public secp256k1 bindings and tagged_hash --
+            same primitives (and same tweak procedure) already relied on
+            elsewhere in this codebase's own taproot test coverage.
+        """
+        tweak = hashes.tagged_hash("TapTweak", internal_xonly + merkle_root)
+        point = secp256k1.ec_pubkey_parse(b"\x02" + internal_xonly)
+        secp256k1.ec_pubkey_tweak_add(point, bytes(tweak))
+        return ec.PublicKey(point).xonly()
 
 
     @staticmethod

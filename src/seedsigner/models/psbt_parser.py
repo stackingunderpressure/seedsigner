@@ -232,10 +232,20 @@ class PSBTParser():
         trimmed_psbt = psbt.PSBT(tx.tx)
         for i, inp in enumerate(tx.inputs):
             if inp.final_scriptwitness:
-                # Taproot sign; trim to only final_scriptwitness
+                # Taproot key-path sign; trim to only final_scriptwitness
                 # From BIP-371 and BIP-174, once final script witness is populated
                 # it contains all necessary signatures
                 trimmed_psbt.inputs[i].final_scriptwitness = inp.final_scriptwitness
+            elif inp.taproot_sigs:
+                # Taproot script-path sign (a tapscript/miniscript leaf, e.g. one
+                # branch of a multi-leaf policy). embit's own sign_with() ->
+                # sign_input_with_tapkey() already produces these correctly (BIP340
+                # Schnorr over the BIP341 tapscript sighash for the matched leaf) --
+                # this method just wasn't carrying the result forward. Each entry is
+                # keyed by (pubkey, leaf_hash), so it's self-describing without
+                # needing to re-transmit the leaf script or control block: whoever
+                # merges this back in already has the original unsigned PSBT.
+                trimmed_psbt.inputs[i].taproot_sigs = inp.taproot_sigs
             else:
                 trimmed_psbt.inputs[i].partial_sigs = inp.partial_sigs
 
@@ -247,8 +257,14 @@ class PSBTParser():
         cnt = 0
         for i, inp in enumerate(tx.inputs):
             if inp.final_scriptwitness is not None:
-                # Taproot sign
+                # Taproot key-path sign
                 cnt += 1
+            elif inp.taproot_sigs:
+                # Taproot script-path sign(s). A single input can legitimately need
+                # more than one of these -- e.g. a 2-of-2 leaf needs a tap_script_sig
+                # from each of its two keys before it's spendable -- so count every
+                # entry, not just whether any exist.
+                cnt += len(inp.taproot_sigs)
             else:
                 cnt += len(list(inp.partial_sigs.keys()))
 
@@ -362,9 +378,16 @@ class PSBTParser():
                 fingerprints.add(hexlify(derivation_path.fingerprint).decode())
 
             for pub, (leaf_hashes, derivation_path) in input.taproot_bip32_derivations.items():
-                # TODO: Support spends from leaves; depends on support in embit
-                if len(leaf_hashes) > 0:
-                    raise Exception("Signing keyspends from within a taptree not yet implemented")
+                # Taproot script-path (tapscript leaf) derivations are included here
+                # too, same as key-path ones -- embit's psbt.sign_with() already
+                # signs these correctly (verified: it produces a valid BIP340
+                # Schnorr signature over the BIP341 tapscript sighash for whichever
+                # leaf the key's fingerprint matches, via sign_input_with_tapkey).
+                # This used to hard-raise here on the mistaken assumption that
+                # embit had no script-path support; it's had it since embit 0.8.0
+                # (this repo's pinned version) added taptree/miniscript support.
+                # See has_matching_input_fingerprint below, which never had this
+                # restriction and already treats leaf-derivations the same way.
                 fingerprints.add(hexlify(derivation_path.fingerprint).decode())
         return list(fingerprints)
 

@@ -367,7 +367,13 @@ class DecodeQR:
                 return QRType.PSBT__BBQR
 
             # Wallet Descriptor
-            desc_str = s.replace("\n","").replace(" ","")
+            # str.split() with no args splits on ANY whitespace run (space,
+            # \t, \r, \n, ...) -- broader than the old .replace("\n","")
+            # .replace(" ","") pair, which left a \r- or \t-prefixed
+            # descriptor unrecognized even though GenericWalletQrDecoder
+            # (below) would have parsed it fine once whitespace-stripped
+            # the same way.
+            desc_str = "".join(s.split())
             if re.search(r'^p(\d+)of(\d+) ', s, re.IGNORECASE):
                 # when not a SPECTER Base64 PSBT from above, assume it's json
                 return QRType.WALLET__SPECTER
@@ -1174,9 +1180,15 @@ class GenericWalletQrDecoder(BaseSingleFrameQrDecoder):
     def add(self, segment, qr_type=QRType.WALLET__GENERIC):
         from embit.descriptor import Descriptor
         try:
+            # Same whitespace-stripping as detect_segment_type's
+            # classification step, so a \r/\t/embedded-whitespace
+            # descriptor that was correctly classified as a wallet
+            # descriptor doesn't then fail to parse here from whitespace
+            # detect_segment_type never saw.
+            stripped_segment = "".join(segment.split())
             # Validate via embit
-            Descriptor.from_string(segment)
-            self.descriptor = segment
+            Descriptor.from_string(stripped_segment)
+            self.descriptor = stripped_segment
             self.complete = True
             return DecodeQRStatus.COMPLETE
         except Exception as e:

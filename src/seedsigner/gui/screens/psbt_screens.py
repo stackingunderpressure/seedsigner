@@ -1,3 +1,4 @@
+import datetime
 import math
 import time
 
@@ -463,6 +464,25 @@ class PSBTOverviewScreen(ButtonListScreen):
 
 
 
+def _format_relative_duration(seconds: int) -> str:
+    """Human-friendly formatting for a BIP68 time-based relative timelock,
+    already converted to seconds by PSBTParser._decode_timelock."""
+    days = seconds / 86400
+    if days >= 1:
+        if days == int(days):
+            # TRANSLATOR_NOTE: A whole number of days, e.g. "30 days"
+            return ngettext("{days} day", "{days} days", int(days)).format(days=int(days))
+        # TRANSLATOR_NOTE: An approximate number of days, e.g. "~2.5 days"
+        return _("~{days:.1f} days").format(days=days)
+    hours = seconds / 3600
+    if hours >= 1:
+        # TRANSLATOR_NOTE: An approximate number of hours, e.g. "~20.5 hours"
+        return _("~{hours:.1f} hours").format(hours=hours)
+    # TRANSLATOR_NOTE: An approximate number of minutes, e.g. "~45 minutes"
+    return _("~{minutes:.0f} minutes").format(minutes=seconds / 60)
+
+
+
 @dataclass
 class PSBTSpendPathScreen(ButtonListScreen):
     """
@@ -474,10 +494,11 @@ class PSBTSpendPathScreen(ButtonListScreen):
     """
     leaf_index: int = None
     leaf_count: int = None
+    multiple_leaves: bool = False
     quorum_k: int = None
     quorum_n: int = None
-    timelock_kind: str = None  # "after" | "older" | None
-    timelock_value: int = None
+    timelock_kind: str = None  # "after_height" | "after_time" | "older_blocks" | "older_time" | None
+    timelock_value: int = None  # blocks for *_height/*_blocks; seconds for *_time
     num_eligible_keys: int = 1
 
     def __post_init__(self):
@@ -488,7 +509,10 @@ class PSBTSpendPathScreen(ButtonListScreen):
 
         screen_y = self.top_nav.height + GUIConstants.COMPONENT_PADDING
 
-        if self.leaf_index is not None and self.leaf_count is not None:
+        if self.multiple_leaves:
+            # TRANSLATOR_NOTE: This transaction signs more than one distinct spending path at once (different inputs, different leaves)
+            value_text = _("Multiple paths")
+        elif self.leaf_index is not None and self.leaf_count is not None:
             # TRANSLATOR_NOTE: e.g. "Leaf 2 of 3" -- which branch of a multi-path taproot policy this signature uses
             value_text = _("Leaf {index} of {count}").format(index=self.leaf_index, count=self.leaf_count)
         else:
@@ -514,12 +538,19 @@ class PSBTSpendPathScreen(ButtonListScreen):
             ))
             screen_y = self.components[-1].screen_y + self.components[-1].height + GUIConstants.COMPONENT_PADDING
 
-        if self.timelock_kind == "after":
+        if self.timelock_kind == "after_height":
             # TRANSLATOR_NOTE: e.g. "After block 840000" -- an absolute-height timelock (CLTV)
             timelock_text = _("After block {n}").format(n=self.timelock_value)
-        elif self.timelock_kind == "older":
-            # TRANSLATOR_NOTE: e.g. "After 144 blocks of age" -- a relative-age timelock (CSV)
+        elif self.timelock_kind == "after_time":
+            # TRANSLATOR_NOTE: e.g. "After 2026-01-01" -- a calendar-date timelock (CLTV encoded as a Unix timestamp)
+            timelock_date = datetime.datetime.fromtimestamp(self.timelock_value, tz=datetime.timezone.utc).strftime("%Y-%m-%d")
+            timelock_text = _("After {date}").format(date=timelock_date)
+        elif self.timelock_kind == "older_blocks":
+            # TRANSLATOR_NOTE: e.g. "After 144 blocks of age" -- a relative-age timelock (CSV), block-based
             timelock_text = _("After {n} blocks of age").format(n=self.timelock_value)
+        elif self.timelock_kind == "older_time":
+            # TRANSLATOR_NOTE: e.g. "After ~30 days of age" -- a relative-age timelock (CSV), time-based
+            timelock_text = _("After {duration} of age").format(duration=_format_relative_duration(self.timelock_value))
         else:
             timelock_text = None
         if timelock_text:
@@ -733,7 +764,7 @@ class PSBTAddressDetailsScreen(ButtonListScreen):
 class PSBTChangeDetailsScreen(ButtonListScreen):
     amount: int = 0
     address: str = None
-    is_multisig: bool = False
+    requires_registered_descriptor: bool = False
     fingerprint: str = None
     derivation_path: str = None
     is_change_derivation_path: bool = True

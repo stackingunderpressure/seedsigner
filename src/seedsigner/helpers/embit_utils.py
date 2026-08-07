@@ -1,7 +1,6 @@
 import embit
 
 from binascii import b2a_base64
-from gettext import gettext as _
 from hashlib import sha256
 
 from embit import bip32, compact, ec
@@ -146,22 +145,67 @@ def is_taproot_miniscript_wallet(descriptor: Descriptor) -> bool:
 
 def is_single_sig_wallet(descriptor: Descriptor) -> bool:
     """
-    True for any descriptor with exactly one key -- legacy p2pkh, nested or
-    native segwit, or single-key taproot (tr(key)). This is the counterpart
-    to is_taproot_miniscript_wallet/descriptor.is_basic_multisig: together
-    the three predicates cover every descriptor shape get_multisig_address
+    True for a BARE single-key descriptor -- legacy p2pkh, nested or native
+    segwit, or single-key taproot (tr(key)) -- with no miniscript policy
+    wrapped around that key. This is the counterpart to
+    is_taproot_miniscript_wallet/descriptor.is_basic_multisig: together the
+    three predicates cover every descriptor shape get_multisig_address
     (despite its name -- it's generic) actually knows how to derive.
+
+    Checking `descriptor.miniscript is None` (not just `len(keys) == 1`) is
+    the fix for a real gap: a single KEY doesn't mean a single-sig POLICY.
+    `wsh(and_v(v:older(144),pk(A)))` has exactly one key but is a timelocked
+    vault -- embit still parses it into `descriptor.miniscript`, unlike a
+    bare wpkh()/pkh()/tr(key), where `.miniscript` is None. Accepting the
+    timelocked shape here and labelling it "Single-sig" (which the
+    registration confirmation screen would have done before this fix) would
+    hide the very condition the user is being asked to confirm. A
+    single-key miniscript policy with real conditions isn't supported by
+    this predicate at all -- it correctly falls through to "unsupported"
+    rather than being mislabeled; genuine support for it is separate,
+    future work.
 
     A watch-only descriptor exported from another coordinator (e.g. a hot
     wallet's xpub from Nunchuk) for a wallet whose seed isn't loaded on this
     device is exactly the case this exists for -- viewing or verifying its
     addresses shouldn't require importing that wallet's private key material.
     """
-    return len(descriptor.keys) == 1
+    return len(descriptor.keys) == 1 and descriptor.miniscript is None
 
 
 
-def _count_tap_leaves(tree) -> int:
+# BIP341's standard "nothing up my sleeve" point (H), used by Liana,
+# DynastyTrust, and this fork's own tr_multileaf test vectors as the
+# taproot internal key when a wallet's design wants NO key-path spend to
+# exist at all -- every real spend must go through a declared script-path
+# leaf. A descriptor whose internal key is anything else has a genuine,
+# spendable key-path alongside its leaves (the shape some third-party
+# coordinators, e.g. Nunchuk-style inheritance plans, produce).
+NUMS_INTERNAL_KEY_XONLY_HEX = "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0"
+
+# BIP371 taproot trees are capped at depth 128; anything deeper than that
+# cannot be a well-formed tree at all. Used as a hard recursion guard so a
+# malformed or adversarial descriptor can't drive unbounded recursion here.
+_MAX_TAP_TREE_DEPTH = 128
+
+
+def is_nums_internal_key(descriptor: Descriptor) -> bool:
+    """
+    True when a taproot descriptor's internal key is the standard BIP341
+    NUMS point -- provably unspendable, meaning this wallet has NO key-path
+    spend at all, only its declared script-path leaves. False for any real,
+    spendable internal key.
+    """
+    if not descriptor.is_taproot:
+        return False
+    try:
+        return descriptor.key.xonly().hex() == NUMS_INTERNAL_KEY_XONLY_HEX
+    except Exception:
+        return False
+
+
+
+def _count_tap_leaves(tree, _depth: int = 0) -> int:
     """
     Recursively counts the script leaves in an embit TapTree. BIP371's tree
     is a binary merkle tree -- an internal node's `.tree` is a 2-tuple of
@@ -176,18 +220,29 @@ def _count_tap_leaves(tree) -> int:
     wallet. Both levels need the None check; a real leaf's `.tree` is always
     its compiled policy object, never None, so this can't misfire on an
     actual leaf.
+
+    `_depth` guards against unbounded recursion on a malformed/adversarial
+    tree -- BIP341 caps real trees at depth 128, so anything deeper is
+    already invalid and not worth walking further.
     """
     if tree is None or tree.tree is None:
         return 0
+    if _depth > _MAX_TAP_TREE_DEPTH:
+        raise ValueError("Tap tree exceeds BIP341's maximum depth -- malformed descriptor")
     if isinstance(tree.tree, tuple):
-        return sum(_count_tap_leaves(child) for child in tree.tree)
+        return sum(_count_tap_leaves(child, _depth + 1) for child in tree.tree)
     return 1
 
 
 
-def get_taproot_policy_summary(descriptor: Descriptor) -> str:
+def get_taproot_policy_summary(descriptor: Descriptor) -> dict:
     """
-    Human-readable summary for a registered taproot multi-leaf descriptor.
+    Raw facts about a taproot descriptor's policy shape. Returns raw data,
+    not a formatted string: this is a helper, not a view, and translation
+    (gettext) belongs at the view layer -- same convention
+    PSBTParser.get_signing_leaf_summary follows, and the one this function
+    itself used to violate (it used to return a pre-translated string,
+    the only gettext use anywhere in this file).
 
     Unlike basic multisig, a multi-leaf taproot policy doesn't reduce to a
     single "M of N" -- a tr_multileaf inheritance vault has a DIFFERENT
@@ -196,19 +251,21 @@ def get_taproot_policy_summary(descriptor: Descriptor) -> str:
     shape (its (threshold, n) contract can't express it and existing
     callers rely on that); this is the taproot-specific counterpart the
     registration screen calls instead.
+
+    Returns:
+        {
+            "num_keys": int,
+            "num_leaves": int,               # 0 for a single-key tr(key)
+            "keypath_spendable": bool,        # True unless the internal key is the NUMS point
+        }
     """
     if not descriptor.is_taproot:
         raise ValueError(f"Expected a taproot descriptor, got: {descriptor.brief_policy}")
-    num_leaves = _count_tap_leaves(descriptor.taptree)
-    if num_leaves == 0:
-        # Single-key tr(key) -- no script tree, just a key-path spend.
-        # "1 keys, 0 leaves" is technically accurate but reads like a
-        # malformed multisig rather than the single-sig wallet it is.
-        return _("Taproot, single-sig")
-    return _("Taproot, {num_keys} keys, {num_leaves} leaves").format(
-        num_keys=len(descriptor.keys),
-        num_leaves=num_leaves,
-    )
+    return {
+        "num_keys": len(descriptor.keys),
+        "num_leaves": _count_tap_leaves(descriptor.taptree),
+        "keypath_spendable": not is_nums_internal_key(descriptor),
+    }
 
 
 

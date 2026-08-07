@@ -151,6 +151,15 @@ class PSBTOverviewView(View):
             self.controller.psbt_seed = None
             return Destination(BackStackView)
 
+        # A taproot input that bypasses a real committed script tree via
+        # the KEY PATH gets a warning first -- this is the spend that
+        # skips every leaf's quorum/timelock entirely (see
+        # PSBTParser._detect_taproot_signing_path), and it's the one case
+        # a coordinator like Nunchuk can produce that a plain single-key
+        # taproot wallet (no tree at all) never does.
+        if psbt_parser.signing_key_path:
+            return Destination(PSBTKeyPathSpendView)
+
         # A taproot script-path (tapscript leaf) signature gets one extra
         # stop before the usual math/change flow: which leaf is this,
         # and (if a wallet descriptor is registered) what does it
@@ -202,6 +211,7 @@ class PSBTSpendPathView(View):
             PSBTSpendPathScreen,
             leaf_index=summary["leaf_index"],
             leaf_count=summary["leaf_count"],
+            multiple_leaves=summary["multiple_leaves"],
             quorum_k=summary["quorum_k"],
             quorum_n=summary["quorum_n"],
             timelock_kind=summary["timelock_kind"],
@@ -211,6 +221,39 @@ class PSBTSpendPathView(View):
 
         if selected_menu_num == RET_CODE__BACK_BUTTON:
             return Destination(BackStackView)
+
+        return PSBTOverviewView._next_destination(psbt_parser)
+
+
+
+class PSBTKeyPathSpendView(View):
+    """
+    Shown when a taproot input with a real committed script tree (leaves
+    exist) is nonetheless being signed via the internal key's KEY PATH,
+    bypassing every leaf's quorum and timelock entirely -- see
+    PSBTParser._detect_taproot_signing_path. Plain single-key taproot
+    wallets (no tree at all) never reach this; only a wallet whose
+    internal key is genuinely spendable alongside script-path leaves
+    does, which is exactly the shape some third-party coordinators (e.g.
+    Nunchuk-style inheritance plans) can produce.
+    """
+    def run(self):
+        selected_menu_num = self.run_screen(
+            WarningScreen,
+            status_headline=_("Key-Path Spend"),
+            text=_("This transaction bypasses every spending-path condition (quorum, timelock) using the wallet's internal key directly. Only continue if you intended a direct spend."),
+            button_data=[ButtonOption("Continue")],
+        )
+
+        if selected_menu_num == RET_CODE__BACK_BUTTON:
+            return Destination(BackStackView)
+
+        psbt_parser: PSBTParser = self.controller.psbt_parser
+        if psbt_parser.get_signing_leaf_summary(self.controller.multisig_wallet_descriptor):
+            # This same PSBT also signs a genuine leaf on a different
+            # input -- show that detail too rather than silently dropping
+            # it once the key-path warning is dismissed.
+            return Destination(PSBTSpendPathView)
 
         return PSBTOverviewView._next_destination(psbt_parser)
 
@@ -481,7 +524,7 @@ class PSBTChangeDetailsView(View):
                 loading_screen.stop()
 
         if is_change_addr_verified == False and (not requires_registered_descriptor or self.controller.multisig_wallet_descriptor is not None):
-            return Destination(PSBTAddressVerificationFailedView, view_args=dict(is_change=is_change_derivation_path, is_multisig=requires_registered_descriptor), clear_history=True)
+            return Destination(PSBTAddressVerificationFailedView, view_args=dict(is_change=is_change_derivation_path, requires_registered_descriptor=requires_registered_descriptor), clear_history=True)
 
         selected_menu_num = self.run_screen(
             PSBTChangeDetailsScreen,
@@ -489,7 +532,7 @@ class PSBTChangeDetailsView(View):
             button_data=button_data,
             address=change_data.get("address"),
             amount=change_data.get("amount"),
-            is_multisig=requires_registered_descriptor,
+            requires_registered_descriptor=requires_registered_descriptor,
             fingerprint=seed_fingerprint,
             derivation_path=derivation_path,
             is_change_derivation_path=is_change_derivation_path,
@@ -520,14 +563,14 @@ class PSBTChangeDetailsView(View):
 
 
 class PSBTAddressVerificationFailedView(View):
-    def __init__(self, is_change: bool = True, is_multisig: bool = False):
+    def __init__(self, is_change: bool = True, requires_registered_descriptor: bool = False):
         super().__init__()
         self.is_change = is_change
-        self.is_multisig = is_multisig
+        self.requires_registered_descriptor = requires_registered_descriptor
 
 
     def run(self):
-        if self.is_multisig:
+        if self.requires_registered_descriptor:
             # TRANSLATOR_NOTE: Variable is either "change" or "self-transfer".
             text = _("Transaction's {} address could not be verified from wallet descriptor.").format(_("change") if self.is_change else _("self-transfer"))
         else:

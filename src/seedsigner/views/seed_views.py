@@ -2019,6 +2019,52 @@ class SeedAddressVerificationSuccessView(View):
 
 
 
+def get_descriptor_policy_display_name(descriptor) -> str:
+    """
+    Human-readable one-line policy summary for a registered/explored wallet
+    descriptor. Shared between the registration confirmation screen (this
+    file, MultisigWalletDescriptorView) and Address Explorer
+    (tools_views.py, ToolsAddressExplorerAddressTypeView) so the three-way
+    dispatch and its ordering constraint (single-sig must be checked before
+    get_multisig_policy, which raises otherwise) live in exactly one place
+    instead of being copy-pasted at both call sites.
+
+    Does the gettext formatting itself (view-layer work); the embit_utils
+    helpers this calls (get_taproot_policy_summary, get_multisig_policy)
+    return raw data only.
+    """
+    from seedsigner.helpers.embit_utils import get_taproot_policy_summary, get_multisig_policy
+
+    if descriptor.is_taproot:
+        summary = get_taproot_policy_summary(descriptor)
+        if summary["num_leaves"] == 0:
+            return _("Taproot, single-sig")
+        if summary["keypath_spendable"]:
+            # TRANSLATOR_NOTE: Describes a taproot wallet whose internal key is a real, spendable key -- not the standard unspendable NUMS point -- so a key-path spend can bypass every leaf's quorum/timelock.
+            keypath_note = _("key-path: SPENDABLE")
+        else:
+            # TRANSLATOR_NOTE: Describes a taproot wallet whose internal key is the standard unspendable NUMS point -- no key-path spend is possible, only its declared leaves.
+            keypath_note = _("key-path: unspendable")
+        # TRANSLATOR_NOTE: Taproot policy summary, e.g. "Taproot, 4 keys, 3 leaves, key-path: unspendable"
+        return _("Taproot, {num_keys} keys, {num_leaves} leaves, {keypath}").format(
+            num_keys=summary["num_keys"],
+            num_leaves=summary["num_leaves"],
+            keypath=keypath_note,
+        )
+
+    elif len(descriptor.keys) == 1:
+        # Single-sig (legacy/nested/native segwit) -- get_multisig_policy
+        # only knows how to express an M-of-N threshold and intentionally
+        # raises for anything else, so this has to be checked first.
+        return _("Single-sig")
+
+    else:
+        threshold, n = get_multisig_policy(descriptor)
+        # TRANSLATOR_NOTE: Multisig policy. For a "2 of 3" policy, "threshold" = 2; "n" = 3
+        return _("{threshold} of {n}").format(threshold=threshold, n=n)
+
+
+
 class LoadMultisigWalletDescriptorView(View):
     SCAN = ButtonOption("Scan descriptor", SeedSignerIconConstants.QRCODE)
     CANCEL = ButtonOption("Cancel")
@@ -2057,20 +2103,8 @@ class MultisigWalletDescriptorView(View):
         for key in descriptor.keys:
             fingerprint = hexlify(key.fingerprint).decode()
             fingerprints.append(fingerprint)
-        
-        if descriptor.is_taproot:
-            from seedsigner.helpers.embit_utils import get_taproot_policy_summary
-            policy = get_taproot_policy_summary(descriptor)
-        elif len(descriptor.keys) == 1:
-            # Single-sig (legacy/nested/native segwit) -- get_multisig_policy
-            # only knows how to express an M-of-N threshold and intentionally
-            # raises for anything else, so this has to be checked first.
-            policy = _("Single-sig")
-        else:
-            from seedsigner.helpers.embit_utils import get_multisig_policy
-            threshold, n = get_multisig_policy(descriptor)
-            # TRANSLATOR_NOTE: Multisig policy. For a "2 of 3" policy, "threshold" = 2; "n" = 3
-            policy = _("{threshold} of {n}").format(threshold=threshold, n=n)
+
+        policy = get_descriptor_policy_display_name(descriptor)
 
         button_data = [self.OK]
         if self.controller.resume_main_flow:

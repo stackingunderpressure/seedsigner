@@ -42,6 +42,33 @@ class PSBTParser():
         # _parse_inputs. Empty for a key-path-only or non-taproot spend.
         self.signing_leaf_hashes = set()
 
+        # Distinct pubkeys (xonly) of THIS seed's own keys found eligible
+        # across all signing leaves -- the real "how many of my keys"
+        # count. NOT the same as len(signing_leaf_hashes), which counts
+        # LEAVES: one key can be eligible on several leaves, and several
+        # keys can share one leaf.
+        self.signing_leaf_pubkeys = set()
+
+        # Per-(input, leaf) records of (leaf_hash, branch_index,
+        # address_index) this seed is genuinely about to sign against.
+        # Richer than signing_leaf_hashes because matching a leaf hash
+        # against a REGISTERED descriptor requires deriving that
+        # descriptor to the same child (branch/index) the PSBT actually
+        # used before its own leaf hashes can be computed and compared --
+        # an un-derived descriptor's leaf keys are the xpub node's own
+        # pubkey, not the signing child's.
+        self.signing_leaf_records = []
+
+        # True when at least one input will be signed via taproot
+        # KEY-PATH by one of this seed's own keys on an output that ALSO
+        # has a real committed script tree (leaves exist) -- i.e. a spend
+        # that bypasses every leaf's quorum/timelock entirely. Detected
+        # by independently reproducing embit's own signing decision (see
+        # _detect_taproot_signing_path), not inferred from any PSBT
+        # metadata claim. A plain single-key taproot wallet (no tree at
+        # all) never sets this -- there's nothing to bypass.
+        self.signing_key_path = False
+
         self.root = None
 
         if self.seed is not None:
@@ -118,19 +145,78 @@ class PSBTParser():
                 if self.policy != inp_policy:
                     raise RuntimeError("Mixed inputs in the transaction")
 
-            # Which tapscript leaf(s) is this seed actually about to sign
-            # on this input, if any? Only counts a leaf when the claimed
-            # pubkey genuinely re-derives from OUR OWN seed at the stated
-            # path (never trust the PSBT's claimed key) -- same
-            # never-trust-the-claim pattern _parse_outputs already uses
-            # for change recognition.
-            for pub, (leaf_hashes, derivation) in inp.taproot_bip32_derivations.items():
-                if not leaf_hashes:
-                    continue  # key-path-only claim on this input, not a leaf
-                candidate = self.root.derive(derivation.derivation)
-                if candidate.to_public().xonly() != pub.xonly():
+            if inp.is_taproot and inp.utxo is not None:
+                self._detect_taproot_signing_path(inp)
+
+    def _detect_taproot_signing_path(self, inp):
+        """
+        Independently reproduces embit's own taproot signing decision
+        (PSBT.sign_input_with_tapkey) for each of THIS seed's own keys
+        claimed on this input, rather than trusting the PSBT's
+        taproot_bip32_derivations leaf_hashes field. That field is
+        coordinator-supplied metadata embit's actual signing algorithm
+        never consults: sign_with()/sign_input_with_tapkey() always tries
+        a KEY-PATH spend first for every candidate key derived from
+        taproot_bip32_derivations -- regardless of whether that same key
+        also carries a non-empty leaf_hashes claim -- and only falls back
+        to matching against the input's real PSBT_IN_TAP_LEAF_SCRIPT
+        control blocks (taproot_scripts) if the key-path check fails. A
+        PSBT can claim a leaf hash that has nothing to do with what
+        actually gets signed; only re-deriving the real decision here,
+        the same way embit does, keeps the spend-path display honest
+        about what this device is actually about to sign, not just what a
+        coordinator claims.
+
+        Never trusts the PSBT's claimed pubkey either -- as with output
+        change recognition, a candidate key is only trusted once it's
+        re-derived from OUR OWN seed and matches the claim.
+        """
+        output_script = inp.utxo.script_pubkey.data
+        merkle_root = inp.taproot_merkle_root or b""
+        # _fill_missing_fingerprints already ran (see parse()) and fills
+        # in any zero/missing fingerprint that genuinely re-derives from
+        # our seed, so by this point a non-matching fingerprint reliably
+        # means "not ours" -- a cheap pre-filter before the EC-heavy
+        # derive() call below.
+        our_fingerprint = self.root.child(0).fingerprint
+
+        for pub, (_claimed_leaf_hashes, derivation) in inp.taproot_bip32_derivations.items():
+            if derivation.fingerprint != our_fingerprint:
+                continue
+            candidate = self.root.derive(derivation.derivation)
+            if candidate.to_public().xonly() != pub.xonly():
+                continue  # claimed key doesn't actually derive from our seed
+
+            # Key-path check first, exactly as embit's
+            # sign_input_with_tapkey does.
+            tweaked = candidate.taproot_tweak(merkle_root)
+            if tweaked.xonly() in output_script:
+                if merkle_root:
+                    # A committed tap tree exists (alternate script-path
+                    # leaves are defined) but this spend bypasses all of
+                    # them via the key path. A plain single-key taproot
+                    # wallet (no tree at all, merkle_root empty) has no
+                    # leaves to bypass -- this is just its only spend
+                    # path, nothing to flag.
+                    self.signing_key_path = True
+                continue
+
+            # Script-path: match against the REAL leaf scripts this input
+            # carries (taproot_scripts), the same source embit's own
+            # signing loop iterates -- not the PSBT's separate, unverified
+            # leaf_hashes claim.
+            candidate_xonly = candidate.to_public().xonly()
+            for control_block, sc in inp.taproot_scripts.items():
+                if candidate_xonly not in sc:
                     continue
-                self.signing_leaf_hashes.update(leaf_hashes)
+                leaf_version = sc[-1]
+                leaf_script = script.Script(sc[:-1])
+                leaf_hash = hashes.tagged_hash("TapLeaf", bytes([leaf_version]) + leaf_script.serialize())
+                self.signing_leaf_hashes.add(leaf_hash)
+                self.signing_leaf_pubkeys.add(candidate_xonly)
+                if len(derivation.derivation) >= 2:
+                    self.signing_leaf_records.append((leaf_hash, derivation.derivation[-2], derivation.derivation[-1]))
+
 
     def _parse_outputs(self):
         self.spend_amount = 0
@@ -613,7 +699,19 @@ class PSBTParser():
             # limitation. Wildcard descriptors are unaffected by the bug
             # (a real wildcard element does set `idx`) and keep using
             # owns() below.
-            return descriptor.derive(0, branch_index=0).script_pubkey() == output.script_pubkey
+            #
+            # One residual wrinkle: "fixed" only means no wildcard (`*`)
+            # element -- a descriptor can still be non-wildcard while
+            # carrying a fixed-index multipath branch (e.g. `<0;1>/5`,
+            # is_wildcard False but the branch still varies). derive() is
+            # only a proven no-op across the INDEX for such a descriptor,
+            # not across branch_index -- so try both branches rather than
+            # hardcoding branch 0, which would falsely report
+            # verification failed for genuine change landing on branch 1.
+            for branch_index in (0, 1):
+                if descriptor.derive(0, branch_index=branch_index).script_pubkey() == output.script_pubkey:
+                    return True
+            return False
 
         is_owner = descriptor.owns(output)
         # print(f"{self.psbt.tx.vout[i].script_pubkey.address()} | {output.value} | {is_owner}")
@@ -687,16 +785,21 @@ class PSBTParser():
         Two honesty tiers, deliberately never blurred:
           - With a REGISTERED descriptor (the wallet policy the user
             confirmed out of band, before this PSBT existed -- see
-            verify_multisig_output), this matches the signing leaf
-            against the wallet's own real tap tree and reports its true
+            verify_multisig_output), this matches each signing leaf
+            against the wallet's own real tap tree -- DERIVED to the same
+            child (branch/index) this PSBT actually used, since an
+            un-derived descriptor's leaf keys are the xpub node's own
+            pubkey, not the signing child's, and would never match a
+            PSBT's real leaf hashes at all -- and reports its true
             position (leaf_index/leaf_count) and, for the handful of
             simple shapes a tr_multileaf-style policy actually produces
             (a bare key threshold, optionally wrapped in an absolute/
-            relative timelock), its real quorum -- read straight from
-            the descriptor's own PARSED miniscript AST (embit's
-            Miniscript.from_string() output), never decompiled from raw
-            script bytes. An unrecognized shape leaves quorum_k/n and
-            the timelock fields as None rather than guessing.
+            relative timelock, either operand order), its real quorum --
+            read straight from the descriptor's own PARSED miniscript AST
+            (embit's Miniscript.from_string() output), never decompiled
+            from raw script bytes. An unrecognized shape leaves
+            quorum_k/n and the timelock fields as None rather than
+            guessing.
           - With no registered descriptor (or one that doesn't match
             this PSBT's leaf at all), only what's independently provable
             from the PSBT's own metadata is reported: that a leaf is
@@ -706,22 +809,31 @@ class PSBTParser():
             proven, only guessed, and a wrong guess here is worse than
             saying nothing.
 
+        A multi-input PSBT can legitimately sign more than one DISTINCT
+        leaf (e.g. one input via the immediate path, another via a
+        timelocked recovery path). Reporting only the first match found
+        would misrepresent a multi-path spend as a single one, so this
+        sets `multiple_leaves` and omits the single-leaf detail fields
+        instead of arbitrarily picking one.
+
         Returns:
             {
-                "num_eligible_keys": int,               # always present
+                "num_eligible_keys": int,               # always present; distinct KEYS, not leaves
+                "multiple_leaves": bool,                 # True if >1 distinct leaf is being signed
                 "leaf_index": int | None,                # 1-based
                 "leaf_count": int | None,
                 "quorum_k": int | None,
                 "quorum_n": int | None,
-                "timelock_kind": "after" | "older" | None,
-                "timelock_value": int | None,
+                "timelock_kind": "after_height" | "after_time" | "older_blocks" | "older_time" | None,
+                "timelock_value": int | None,             # blocks for *_height/*_blocks; seconds for *_time
             }
         """
         if not self.signing_leaf_hashes:
             return None
 
         summary = {
-            "num_eligible_keys": len(self.signing_leaf_hashes),
+            "num_eligible_keys": len(self.signing_leaf_pubkeys),
+            "multiple_leaves": False,
             "leaf_index": None,
             "leaf_count": None,
             "quorum_k": None,
@@ -734,37 +846,109 @@ class PSBTParser():
             return summary
 
         from embit.descriptor.taptree import _tweak_helper
-        try:
-            leaves_with_paths, _ = _tweak_helper(registered_descriptor.taptree)
-        except Exception:
-            logger.info("Could not walk registered descriptor's tap tree", exc_info=True)
+
+        # Cache derived-tree leaves per (branch_index, address_index) so a
+        # multi-input PSBT signing several leaves at the same child
+        # doesn't re-derive/re-walk the whole tree once per leaf record.
+        derived_leaves_cache = {}
+        matched_leaf_indices = set()
+        matched_leaf_count = None
+        matched_detail = None  # (leaf_index, leaf_count, k, n, timelock_kind, timelock_value)
+
+        for leaf_hash, branch_index, address_index in self.signing_leaf_records:
+            cache_key = (branch_index, address_index)
+            if cache_key not in derived_leaves_cache:
+                try:
+                    derived = registered_descriptor.derive(address_index, branch_index=branch_index)
+                    leaves_with_paths, _ = _tweak_helper(derived.taptree)
+                except Exception:
+                    logger.info("Could not walk registered descriptor's tap tree", exc_info=True)
+                    leaves_with_paths = []
+                derived_leaves_cache[cache_key] = leaves_with_paths
+
+            leaves_with_paths = derived_leaves_cache[cache_key]
+            if leaves_with_paths:
+                matched_leaf_count = len(leaves_with_paths)
+
+            for idx, (leaf, _path) in enumerate(leaves_with_paths):
+                # leaf.serialize() (not a from-scratch bytes([version]) +
+                # miniscript.compile()) -- the real BIP341 TapLeaf
+                # preimage needs the script compact-size-length-prefixed,
+                # which TapLeaf.serialize() already does correctly.
+                candidate_hash = hashes.tagged_hash("TapLeaf", leaf.serialize())
+                if candidate_hash != leaf_hash:
+                    continue
+                matched_leaf_indices.add(idx)
+                if matched_detail is None:
+                    k, n, timelock_kind, timelock_value = PSBTParser._parse_leaf_quorum(leaf.miniscript)
+                    matched_detail = (idx + 1, len(leaves_with_paths), k, n, timelock_kind, timelock_value)
+                break
+
+        if not matched_leaf_indices:
+            # No match against this registered descriptor's tree (wrong
+            # wallet registered, an unwalkable shape, or this PSBT's
+            # claimed derivation doesn't correspond to this descriptor at
+            # all) -- summary stays at its "just a bare fact" defaults,
+            # same as the no-descriptor tier. Never claim a position that
+            # wasn't actually proven against this exact tree.
             return summary
 
-        for idx, (leaf, _path) in enumerate(leaves_with_paths):
-            # leaf.serialize() (not a from-scratch bytes([version]) +
-            # miniscript.compile()) -- the real BIP341 TapLeaf preimage
-            # needs the script compact-size-length-prefixed, which
-            # TapLeaf.serialize() already does correctly; reconstructing
-            # it by hand here previously dropped that prefix and made
-            # every leaf hash mismatch, silently: caught by the sanity
-            # check in this method's own tests.
-            leaf_hash = hashes.tagged_hash("TapLeaf", leaf.serialize())
-            if leaf_hash not in self.signing_leaf_hashes:
-                continue
-            summary["leaf_index"] = idx + 1
-            summary["leaf_count"] = len(leaves_with_paths)
-            k, n, timelock_kind, timelock_value = PSBTParser._parse_leaf_quorum(leaf.miniscript)
-            summary["quorum_k"] = k
-            summary["quorum_n"] = n
-            summary["timelock_kind"] = timelock_kind
-            summary["timelock_value"] = timelock_value
-            break
-        # No match found (e.g. a different wallet's descriptor is
-        # registered) -- summary stays at its "just a bare fact" defaults,
-        # same as the no-descriptor tier. Never claim a position that
-        # wasn't actually proven against this exact tree.
+        if len(matched_leaf_indices) > 1:
+            # Distinct leaves matched across different inputs -- reporting
+            # a single leaf_index would misrepresent a multi-path spend as
+            # one path.
+            summary["multiple_leaves"] = True
+            summary["leaf_count"] = matched_leaf_count
+            return summary
 
+        leaf_index, leaf_count, k, n, timelock_kind, timelock_value = matched_detail
+        summary["leaf_index"] = leaf_index
+        summary["leaf_count"] = leaf_count
+        summary["quorum_k"] = k
+        summary["quorum_n"] = n
+        summary["timelock_kind"] = timelock_kind
+        summary["timelock_value"] = timelock_value
         return summary
+
+
+    @staticmethod
+    def _decode_timelock(inner) -> tuple:
+        """
+        Decodes a parsed After()/Older() miniscript node's raw argument
+        into its real-world unit, per the two relevant BIPs -- the raw
+        integer alone is not self-describing:
+
+          - after(n): BIP65 CLTV. n < 500_000_000 is an absolute BLOCK
+            HEIGHT; n >= 500_000_000 is a UNIX TIMESTAMP. Rendering every
+            after() as a block height (as this used to) turns a real
+            calendar-date CLTV into a meaningless nine-digit "block".
+          - older(n): BIP68 CSV. Bit 22 (0x400000) is the type flag: when
+            SET, the low 16 bits are units of 512 SECONDS, not blocks.
+            Rendering every older() as a raw block count (as this used
+            to) can turn a real ~20-hour relative lock into "~80 years"
+            -- exactly backwards. When the flag is clear, the low 16
+            bits are the real block count.
+
+        Returns (timelock_kind, timelock_value) where timelock_kind is
+        one of "after_height" | "after_time" | "older_blocks" |
+        "older_time", and timelock_value is already in the right unit
+        (blocks, or seconds for the *_time kinds) -- no further
+        unit-guessing needed at render time.
+        """
+        from embit.descriptor.miniscript import After, Older
+
+        n = int(str(inner.args[0]))
+        if isinstance(inner, After):
+            if n >= 500_000_000:
+                return ("after_time", n)
+            return ("after_height", n)
+        elif isinstance(inner, Older):
+            BIP68_TIME_FLAG = 0x400000
+            BIP68_VALUE_MASK = 0xFFFF
+            if n & BIP68_TIME_FLAG:
+                return ("older_time", (n & BIP68_VALUE_MASK) * 512)
+            return ("older_blocks", n & BIP68_VALUE_MASK)
+        return (None, None)
 
 
     @staticmethod
@@ -776,9 +960,20 @@ class PSBTParser():
         repo won't take). Only recognizes the small set of shapes a
         tr_multileaf-style policy actually produces: a bare multi-key
         threshold (multi_a/multi/sortedmulti/sortedmulti_a), a single key
-        (pk), either optionally wrapped in and_v(v:after(N), ...) or
-        and_v(v:older(N), ...) for a timelocked leaf. Anything else
-        returns all-None rather than guessing.
+        (pk), optionally combined with an after(N)/older(N) timelock via
+        and_v(A, B). and_v(A, B) requires exactly ONE side to be V-typed
+        (wrapped in `v:`), and different compilers pick different sides
+        for it: a DynastyTrust-compiled leaf wraps the TIMELOCK
+        (and_v(v:after(500), multi_a(...))), while a real Nunchuk
+        inheritance-plan export wraps the QUORUM
+        (and_v(v:multi_a(...), older(N))) -- the timelock there is the
+        plain second argument, not itself V-wrapped (older()/after() are
+        already B-typed, so and_v's un-wrapped slot accepts them
+        directly). Both of and_v's two argument positions are checked,
+        each optionally unwrapped from `v:` first, for whichever one is
+        actually an After/Older node; the other position (also unwrapped
+        if needed) is then the quorum requirement. Anything else returns
+        all-None rather than guessing.
 
         Returns (k, n, timelock_kind, timelock_value), any of which may
         be None.
@@ -787,25 +982,30 @@ class PSBTParser():
             AndV, V, After, Older, MultiA, Multi, Sortedmulti, SortedmultiA, Pk,
         )
 
+        def _unwrap_v(n):
+            if isinstance(n, V) and len(n.args) == 1:
+                return n.args[0]
+            return n
+
         timelock_kind = None
         timelock_value = None
 
         if isinstance(node, AndV) and len(node.args) == 2:
-            wrapped, requirement = node.args
-            if not (isinstance(wrapped, V) and len(wrapped.args) == 1):
-                return (None, None, None, None)
-            inner = wrapped.args[0]
-            if isinstance(inner, After):
-                timelock_kind = "after"
-            elif isinstance(inner, Older):
-                timelock_kind = "older"
-            else:
+            timelock_node = None
+            quorum_node = None
+            for i, arg in enumerate(node.args):
+                candidate = _unwrap_v(arg)
+                if isinstance(candidate, (After, Older)):
+                    timelock_node = candidate
+                    quorum_node = _unwrap_v(node.args[1 - i])
+                    break
+            if timelock_node is None:
                 return (None, None, None, None)
             try:
-                timelock_value = int(str(inner.args[0]))
+                timelock_kind, timelock_value = PSBTParser._decode_timelock(timelock_node)
             except (ValueError, IndexError):
                 return (None, None, None, None)
-            node = requirement
+            node = quorum_node
 
         if isinstance(node, (MultiA, Multi, Sortedmulti, SortedmultiA)):
             try:

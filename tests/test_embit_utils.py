@@ -647,13 +647,14 @@ class TestTaprootDescriptorRegistration:
         assert address.startswith("tb1p")
 
     def test_get_taproot_policy_summary(self):
+        """get_taproot_policy_summary returns raw data (a dict), not a
+        formatted string -- translation belongs at the view layer
+        (get_descriptor_policy_display_name in seed_views.py)."""
         descriptor = self._tr_multileaf_descriptor()
         summary = embit_utils.get_taproot_policy_summary(descriptor)
         # descriptor.keys includes the NUMS internal key plus both signer
         # keys -- 3 total, not just the 2 signers.
-        assert "3 keys" in summary
-        assert "2 leaves" in summary
-        assert "Taproot" in summary
+        assert summary == {"num_keys": 3, "num_leaves": 2, "keypath_spendable": False}
 
         # Non-taproot descriptor should raise ValueError, mirroring
         # get_multisig_policy's own non-basic-multisig guard.
@@ -663,14 +664,15 @@ class TestTaprootDescriptorRegistration:
                 "wpkh([73c5da0a/84h/1h/0h]tpubDC5FSnBiZDMmhiuCmWAYsLwgLYrrT9rAqvTySfuCCrgsWz8wxMXUS9Tb9iVMvcRbvFcAHGkMD5Kx8koh4GquNGNTfohfk7pgjhaPCdXpoba/{0,1}/*)#2aj6cvca"
             ))
 
-        # Single-key tr(key) has 0 leaves -- should read as "single-sig",
-        # not the technically-true-but-confusing "1 keys, 0 leaves".
+        # Single-key tr(key)'s internal key IS the signing key, so it's
+        # trivially "spendable" -- keypath_spendable is only meaningful
+        # for the multi-leaf case, where the view layer skips it entirely
+        # for num_leaves == 0.
         single_key = Descriptor.from_string(
             "tr([73c5da0a/86h/1h/0h]tpubDC5FSnBiZDMmhiuCmWAYsLwgLYrrT9rAqvTySfuCCrgsWz8wxMXUS9Tb9iVMvcRbvFcAHGkMD5Kx8koh4GquNGNTfohfk7pgjhaPCdXpoba/0/0)"
         )
         single_key_summary = embit_utils.get_taproot_policy_summary(single_key)
-        assert single_key_summary == "Taproot, single-sig"
-        assert "0 leaves" not in single_key_summary
+        assert single_key_summary["num_leaves"] == 0
 
     def test_get_taproot_policy_summary_counts_a_larger_tree_correctly(self):
         """A 3-leaf tree (uneven binary tree -- 1 leaf at depth 1, 2 at
@@ -686,5 +688,42 @@ class TestTaprootDescriptorRegistration:
         descriptor = Descriptor.from_string(desc_str)
         summary = embit_utils.get_taproot_policy_summary(descriptor)
         # NUMS internal key + 3 signer keys = 4.
-        assert "4 keys" in summary
-        assert "3 leaves" in summary
+        assert summary["num_keys"] == 4
+        assert summary["num_leaves"] == 3
+
+    def test_is_nums_internal_key(self):
+        descriptor = self._tr_multileaf_descriptor()
+        assert embit_utils.is_nums_internal_key(descriptor) is True
+
+        from embit.descriptor import Descriptor
+        real_key_wallet = Descriptor.from_string(
+            "tr([73c5da0a/86h/1h/0h]tpubDC5FSnBiZDMmhiuCmWAYsLwgLYrrT9rAqvTySfuCCrgsWz8wxMXUS9Tb9iVMvcRbvFcAHGkMD5Kx8koh4GquNGNTfohfk7pgjhaPCdXpoba,"
+            "{pk([0be174ee/86h/1h/0h]tpubDEsePyLPkbxbnj6XuKvWwdERHaKkikZxaGJ9sJqmM7okbZXgkNSFiGU6GX6qEes6kD8f9Z9FosYB9UEnBSgBEyEwwJhj4uUcFE1WE8VtKoh)}"
+            ")"
+        )
+        assert embit_utils.is_nums_internal_key(real_key_wallet) is False
+
+        native_segwit = Descriptor.from_string(
+            "wpkh([73c5da0a/84h/1h/0h]tpubDC5FSnBiZDMmhiuCmWAYsLwgLYrrT9rAqvTySfuCCrgsWz8wxMXUS9Tb9iVMvcRbvFcAHGkMD5Kx8koh4GquNGNTfohfk7pgjhaPCdXpoba/{0,1}/*)#2aj6cvca"
+        )
+        assert embit_utils.is_nums_internal_key(native_segwit) is False  # not taproot at all
+
+    def test_is_single_sig_wallet_rejects_wrapped_single_key_miniscript(self):
+        """A single KEY doesn't mean a single-sig POLICY --
+        wsh(and_v(v:older(144),pk(A))) has exactly one key but is a
+        timelocked vault; embit still parses it into descriptor.miniscript,
+        unlike a bare wpkh()/pkh()/tr(key), where .miniscript is None. This
+        used to be accepted and mislabeled "Single-sig", hiding the
+        timelock from the registration confirmation screen."""
+        from embit.descriptor import Descriptor
+        timelocked_single_key = Descriptor.from_string(
+            "wsh(and_v(v:older(144),pk([73c5da0a/84h/1h/0h]tpubDC5FSnBiZDMmhiuCmWAYsLwgLYrrT9rAqvTySfuCCrgsWz8wxMXUS9Tb9iVMvcRbvFcAHGkMD5Kx8koh4GquNGNTfohfk7pgjhaPCdXpoba/{0,1}/*)))"
+        )
+        assert len(timelocked_single_key.keys) == 1
+        assert timelocked_single_key.miniscript is not None
+        assert embit_utils.is_single_sig_wallet(timelocked_single_key) is False
+
+        bare_native_segwit = Descriptor.from_string(
+            "wpkh([73c5da0a/84h/1h/0h]tpubDC5FSnBiZDMmhiuCmWAYsLwgLYrrT9rAqvTySfuCCrgsWz8wxMXUS9Tb9iVMvcRbvFcAHGkMD5Kx8koh4GquNGNTfohfk7pgjhaPCdXpoba/{0,1}/*)#2aj6cvca"
+        )
+        assert embit_utils.is_single_sig_wallet(bare_native_segwit) is True

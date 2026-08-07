@@ -106,28 +106,59 @@ class ScanView(View):
                 from seedsigner.views.seed_views import MultisigWalletDescriptorView
                 descriptor_str = self.decoder.get_wallet_descriptor()
 
-                try:
-                    # We need to replace `/0/*` wildcards with `/{0,1}/*` in order to use
-                    # the Descriptor to verify change, too.
-                    orig_descriptor_str = descriptor_str
-                    if len(re.findall (r'\[([0-9,a-f,A-F]+?)(\/[0-9,\/,h\']+?)\].*?(\/0\/\*)', descriptor_str)) > 0:
-                        p = re.compile(r'(\[[0-9,a-f,A-F]+?\/[0-9,\/,h\']+?\].*?)(\/0\/\*)')
-                        descriptor_str = p.sub(r'\1/{0,1}/*', descriptor_str)
-                    elif len(re.findall (r'(\[[0-9,a-f,A-F]+?\/[0-9,\/,h,\']+?\][a-z,A-Z,0-9]*?)([\,,\)])', descriptor_str)) > 0:
-                        p = re.compile(r'(\[[0-9,a-f,A-F]+?\/[0-9,\/,h,\']+?\][a-z,A-Z,0-9]*?)([\,,\)])')
-                        descriptor_str = p.sub(r'\1/{0,1}/*\2', descriptor_str)
-                except Exception as e:
-                    logger.info(repr(e), exc_info=True)
-                    descriptor_str = orig_descriptor_str
+                orig_descriptor_str = descriptor_str
+                # This legacy `/0/*` -> `/{0,1}/*` rewrite is meant for
+                # legacy/segwit multisig-style key expressions
+                # ([fp/path]xpub/0/*) and actively corrupts a taproot
+                # leaf key expressed as a bare, already-derived xonly
+                # pubkey with no further derivation possible (e.g.
+                # [fp/path/0/0]<64-hex-xonly>) -- appending /{0,1}/* to a
+                # key that can't be derived any further makes
+                # Descriptor.from_string raise. Taproot descriptors don't
+                # need this rewrite in the first place: a multi-leaf
+                # tree's leaves are matched directly against the PSBT's
+                # own leaf hashes (PSBTParser.get_signing_leaf_summary),
+                # not via Descriptor.owns()'s wildcard-branch machinery
+                # the way legacy multisig change verification is.
+                if not descriptor_str.lstrip().startswith("tr("):
+                    try:
+                        if len(re.findall (r'\[([0-9,a-f,A-F]+?)(\/[0-9,\/,h\']+?)\].*?(\/0\/\*)', descriptor_str)) > 0:
+                            p = re.compile(r'(\[[0-9,a-f,A-F]+?\/[0-9,\/,h\']+?\].*?)(\/0\/\*)')
+                            descriptor_str = p.sub(r'\1/{0,1}/*', descriptor_str)
+                        elif len(re.findall (r'(\[[0-9,a-f,A-F]+?\/[0-9,\/,h,\']+?\][a-z,A-Z,0-9]*?)([\,,\)])', descriptor_str)) > 0:
+                            p = re.compile(r'(\[[0-9,a-f,A-F]+?\/[0-9,\/,h,\']+?\][a-z,A-Z,0-9]*?)([\,,\)])')
+                            descriptor_str = p.sub(r'\1/{0,1}/*\2', descriptor_str)
+                    except Exception as e:
+                        logger.info(repr(e), exc_info=True)
+                        descriptor_str = orig_descriptor_str
 
-                descriptor = Descriptor.from_string(descriptor_str)
+                try:
+                    descriptor = Descriptor.from_string(descriptor_str)
+                except Exception as e:
+                    # The scanned QR is the primary attacker-controlled
+                    # input surface on this device -- a malformed or
+                    # unparseable descriptor should land on a clean error,
+                    # not a raw exception/debug screen.
+                    logger.info("Could not parse scanned descriptor: %s", repr(e), exc_info=True)
+                    return Destination(ErrorView, view_args=dict(
+                        title="Error",
+                        status_headline=_("Invalid Descriptor"),
+                        text=_("QRCode did not contain a valid wallet descriptor."),
+                        button_text="Back",
+                        next_destination=Destination(BackStackView, skip_current_view=True),
+                    ))
 
                 from seedsigner.helpers.embit_utils import is_taproot_miniscript_wallet, is_single_sig_wallet
                 if not descriptor.is_basic_multisig and not is_taproot_miniscript_wallet(descriptor) and not is_single_sig_wallet(descriptor):
                     # A descriptor policy shape we don't know how to derive
                     # addresses for (not basic multisig, not a taproot
-                    # multi-leaf wallet, not single-key).
-                    logger.info(f"Received unsupported descriptor policy: {descriptor}")
+                    # multi-leaf wallet, not single-key). Log only the
+                    # policy shape, never the descriptor itself -- a
+                    # descriptor scanned here can legitimately embed an
+                    # xprv (e.g. a coordinator backup export), and private
+                    # key material must never be written to a log line on
+                    # money-touching firmware.
+                    logger.info("Received unsupported descriptor policy: %s", descriptor.brief_policy)
                     return Destination(NotYetImplementedView)
 
                 self.controller.multisig_wallet_descriptor = descriptor

@@ -599,22 +599,8 @@ class ToolsAddressExplorerAddressTypeView(View):
 
         wallet_descriptor_display_name = None
         if "wallet_descriptor" in data:
-            descriptor = data["wallet_descriptor"]
-            if descriptor.is_taproot:
-                from seedsigner.helpers.embit_utils import get_taproot_policy_summary
-                wallet_descriptor_display_name = get_taproot_policy_summary(descriptor)
-            elif len(descriptor.keys) == 1:
-                # Single-sig (legacy/nested/native segwit) -- get_multisig_policy
-                # only expresses an M-of-N threshold and intentionally raises for
-                # anything else, so this has to be checked first.
-                wallet_descriptor_display_name = _("Single-sig")
-            else:
-                from seedsigner.helpers.embit_utils import get_multisig_policy
-                threshold, n = get_multisig_policy(descriptor)
-                # TRANSLATOR_NOTE: Multisig policy. For a "2 / 3 multisig" policy, "threshold" = 2; "n" = 3
-                wallet_descriptor_display_name = _("{threshold} / {n} multisig").format(
-                    threshold=threshold, n=n
-                )
+            from seedsigner.views.seed_views import get_descriptor_policy_display_name
+            wallet_descriptor_display_name = get_descriptor_policy_display_name(data["wallet_descriptor"])
 
         script_type = data["script_type"] if "script_type" in data else None
 
@@ -698,10 +684,23 @@ class ToolsAddressExplorerAddressListView(View):
                     from embit.descriptor import Descriptor
                     descriptor: Descriptor = data["wallet_descriptor"]
                     if descriptor.is_basic_multisig or embit_utils.is_taproot_miniscript_wallet(descriptor) or embit_utils.is_single_sig_wallet(descriptor):
-                        for i in range(self.start_index, self.start_index + addrs_per_screen):
-                            address = embit_utils.get_multisig_address(descriptor=descriptor, index=i, is_change=self.is_change, embit_network=data["embit_network"])
-                            addresses.append(address)
-                            data[addr_storage_key].append(address)
+                        if not descriptor.is_wildcard:
+                            # A fixed (non-ranged) descriptor resolves to
+                            # exactly ONE address regardless of index --
+                            # e.g. DynastyTrust's tr_multileaf vaults are
+                            # deliberately a single immutable address.
+                            # Looping addrs_per_screen times would just
+                            # recompute the identical script/tweak over
+                            # and over to show ten copies of the same
+                            # address.
+                            address = embit_utils.get_multisig_address(descriptor=descriptor, index=0, is_change=self.is_change, embit_network=data["embit_network"])
+                            addresses = [address]
+                            data[addr_storage_key] = [address]
+                        else:
+                            for i in range(self.start_index, self.start_index + addrs_per_screen):
+                                address = embit_utils.get_multisig_address(descriptor=descriptor, index=i, is_change=self.is_change, embit_network=data["embit_network"])
+                                addresses.append(address)
+                                data[addr_storage_key].append(address)
 
                     else:
                         raise Exception(_("Unsupported descriptor type"))

@@ -301,6 +301,32 @@ class TestVerifyMultisigOutputAgainstRegisteredTaprootDescriptor:
         parser = PSBTParser(psbt, self.seed_a, network=SettingsConstants.REGTEST)
         assert parser.verify_multisig_output(wrong_descriptor, change_num=0) is False
 
+    def test_verify_multisig_output_tries_both_branches_for_a_fixed_but_multipath_descriptor(self):
+        """A descriptor can be non-wildcard (a fixed INDEX, no `*`) while
+        still carrying a real `<0;1>` multipath BRANCH element -- derive()
+        is only a proven no-op across the index for such a descriptor, not
+        across branch_index. The fix used to hardcode branch_index=0;
+        change genuinely landing on branch 1 would falsely report
+        verification failed on an otherwise-valid transaction."""
+        embit_network = NETWORKS[SettingsConstants.map_network_to_embit(SettingsConstants.REGTEST)]
+        root_a = bip32.HDKey.from_seed(self.seed_a.seed_bytes, version=embit_network["xprv"])
+        account_xpub = root_a.derive([0x80000000 + 86, 0x80000000 + 1, 0x80000000 + 0]).to_public()
+        fp_a = root_a.my_fingerprint
+        desc_str = f"tr([{fp_a.hex()}/86h/1h/0h]{account_xpub.to_base58()}/{{0,1}}/5)"
+        descriptor = Descriptor.from_string(desc_str)
+        assert descriptor.is_wildcard is False, "fixed index (5) -- no wildcard -- but branch still varies"
+
+        branch0_script_pubkey = descriptor.derive(5, branch_index=0).script_pubkey()
+        branch1_script_pubkey = descriptor.derive(5, branch_index=1).script_pubkey()
+        assert branch0_script_pubkey.data != branch1_script_pubkey.data, "the two branches must actually differ for this test to mean anything"
+
+        parser = PSBTParser.__new__(PSBTParser)
+        parser.change_data = [{"output_index": 0}]
+        fake_output = type("FakeOutput", (), {"script_pubkey": branch1_script_pubkey})()
+        parser.psbt = type("FakePSBT", (), {"outputs": [fake_output]})()
+
+        assert parser.verify_multisig_output(descriptor, change_num=0) is True
+
 
 
 class TestTaprootScriptPathChangeFlagsForRegisteredDescriptorVerification:

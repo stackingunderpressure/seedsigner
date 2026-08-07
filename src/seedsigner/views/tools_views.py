@@ -648,6 +648,7 @@ class ToolsAddressExplorerAddressListView(View):
         button_data = []
         data = self.controller.address_explorer_data
         addrs_per_screen = 10
+        show_next_button = True
 
         addr_storage_key = "receive_addrs"
         if self.is_change:
@@ -692,10 +693,22 @@ class ToolsAddressExplorerAddressListView(View):
                             # Looping addrs_per_screen times would just
                             # recompute the identical script/tweak over
                             # and over to show ten copies of the same
-                            # address.
+                            # address. Always recompute at index 0
+                            # (ignoring self.start_index) and never offer
+                            # a "Next" page -- data[addr_storage_key] is
+                            # NOT an index-aligned paginated cache for
+                            # this shape (that invariant, which the
+                            # retrieval check above and the NEXT handler
+                            # below both rely on, only holds for the
+                            # incrementally-appended wildcard case),
+                            # replacing it here instead of appending to it
+                            # would otherwise relabel this same single
+                            # address under a fabricated, ever-increasing
+                            # index every time "Next" was clicked.
                             address = embit_utils.get_multisig_address(descriptor=descriptor, index=0, is_change=self.is_change, embit_network=data["embit_network"])
                             addresses = [address]
                             data[addr_storage_key] = [address]
+                            show_next_button = False
                         else:
                             for i in range(self.start_index, self.start_index + addrs_per_screen):
                                 address = embit_utils.get_multisig_address(descriptor=descriptor, index=i, is_change=self.is_change, embit_network=data["embit_network"])
@@ -708,27 +721,34 @@ class ToolsAddressExplorerAddressListView(View):
                 # Everything is set. Stop the loading screen
                 self.loading_screen.stop()
 
+        # A fixed descriptor's single address has no real "position" in a
+        # paginated sequence -- always display and index it as 0, even if
+        # this view were somehow reached with a nonzero start_index (e.g.
+        # a stale BackStack replay from before show_next_button existed).
+        display_start_index = self.start_index if show_next_button else 0
+
         selected_menu_num = self.run_screen(
             ToolsAddressExplorerAddressListScreen,
             title=_("Receive Addrs") if not self.is_change else _("Change Addrs"),
-            start_index=self.start_index,
+            start_index=display_start_index,
             addresses=addresses,
             selected_button=self.selected_button_index,
             scroll_y_initial_offset=self.initial_scroll,
+            show_next_button=show_next_button,
         )
 
         if selected_menu_num == RET_CODE__BACK_BUTTON:
             return Destination(BackStackView)
-        
-        if selected_menu_num == len(addresses):
+
+        if show_next_button and selected_menu_num == len(addresses):
             # User clicked NEXT
             return Destination(ToolsAddressExplorerAddressListView, view_args=dict(is_change=self.is_change, start_index=self.start_index + addrs_per_screen))
-        
+
         # Preserve the list's current scroll so we can return to the same spot
         initial_scroll = self.screen.buttons[0].scroll_y
 
-        index = selected_menu_num + self.start_index
-        return Destination(ToolsAddressExplorerAddressView, view_args=dict(index=index, address=addresses[selected_menu_num], is_change=self.is_change, start_index=self.start_index, parent_initial_scroll=initial_scroll), skip_current_view=True)
+        index = selected_menu_num + display_start_index
+        return Destination(ToolsAddressExplorerAddressView, view_args=dict(index=index, address=addresses[selected_menu_num], is_change=self.is_change, start_index=display_start_index, parent_initial_scroll=initial_scroll), skip_current_view=True)
 
 
 

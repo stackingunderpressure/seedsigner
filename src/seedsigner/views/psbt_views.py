@@ -151,12 +151,32 @@ class PSBTOverviewView(View):
             self.controller.psbt_seed = None
             return Destination(BackStackView)
 
-        # A taproot input that bypasses a real committed script tree via
-        # the KEY PATH gets a warning first -- this is the spend that
-        # skips every leaf's quorum/timelock entirely (see
-        # PSBTParser._detect_taproot_signing_path), and it's the one case
-        # a coordinator like Nunchuk can produce that a plain single-key
-        # taproot wallet (no tree at all) never does.
+        return PSBTOverviewView._route_after_overview(psbt_parser, self.controller.multisig_wallet_descriptor)
+
+
+    @staticmethod
+    def _route_after_overview(psbt_parser: PSBTParser, multisig_wallet_descriptor) -> Destination:
+        """
+        The one decision point for whether a taproot key-path-bypass
+        warning or leaf/quorum/timelock disclosure should show before the
+        ordinary math/change flow. Called once right after
+        PSBTOverviewView's own screen is dismissed, and AGAIN from
+        MultisigWalletDescriptorView's RETURN branch when a wallet
+        descriptor gets registered mid-PSBT-review -- without this second
+        call site, that journey (scan PSBT with no descriptor registered
+        yet -> land in change verification -> register a descriptor from
+        there -> return) jumped straight to PSBTChangeDetailsView and
+        permanently skipped this disclosure, even though the device now
+        holds exactly the data (the registered descriptor) needed to show
+        which leaf, what quorum, and what timelock is being signed.
+
+        Deliberately NOT called again after PSBTSpendPathView/
+        PSBTKeyPathSpendView are actually shown -- those views call
+        _next_destination directly (with their own narrower re-checks
+        where warranted, e.g. PSBTKeyPathSpendView also checking for a
+        genuine leaf signature on a different input) so the same
+        disclosure doesn't re-trigger itself forever.
+        """
         if psbt_parser.signing_key_path:
             return Destination(PSBTKeyPathSpendView)
 
@@ -166,7 +186,7 @@ class PSBTOverviewView(View):
         # actually require. Plain single-key and legacy multisig spends
         # have nothing to show here (get_signing_leaf_summary returns
         # None) and go straight through, unaffected.
-        if psbt_parser.get_signing_leaf_summary(self.controller.multisig_wallet_descriptor):
+        if psbt_parser.get_signing_leaf_summary(multisig_wallet_descriptor):
             return Destination(PSBTSpendPathView)
 
         return PSBTOverviewView._next_destination(psbt_parser)
@@ -523,7 +543,7 @@ class PSBTChangeDetailsView(View):
             finally:
                 loading_screen.stop()
 
-        if is_change_addr_verified == False and (not requires_registered_descriptor or self.controller.multisig_wallet_descriptor is not None):
+        if not is_change_addr_verified and (not requires_registered_descriptor or self.controller.multisig_wallet_descriptor is not None):
             return Destination(PSBTAddressVerificationFailedView, view_args=dict(is_change=is_change_derivation_path, requires_registered_descriptor=requires_registered_descriptor), clear_history=True)
 
         selected_menu_num = self.run_screen(
@@ -532,7 +552,6 @@ class PSBTChangeDetailsView(View):
             button_data=button_data,
             address=change_data.get("address"),
             amount=change_data.get("amount"),
-            requires_registered_descriptor=requires_registered_descriptor,
             fingerprint=seed_fingerprint,
             derivation_path=derivation_path,
             is_change_derivation_path=is_change_derivation_path,

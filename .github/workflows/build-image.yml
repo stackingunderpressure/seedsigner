@@ -41,8 +41,23 @@ jobs:
           df -h
 
       - name: checkout seedsigner-os
+        env:
+          # Pinned to a specific reviewed commit on seedsigner-os's main
+          # branch, not a moving branch ref -- an unpinned `git clone` of
+          # this repo (and its submodules, since --recursive resolves
+          # them from whatever this commit's tree points them at) means
+          # every build of THIS fork's dev branch also silently pulls in
+          # whatever upstream OS/toolchain changes landed since the last
+          # build, with no review step and no way to tell what actually
+          # went into a given image. Update this SHA deliberately (and
+          # note why in the commit message) when a newer seedsigner-os
+          # commit is actually wanted.
+          SEEDSIGNER_OS_COMMIT: d5a1077851a9b41d6637f7317e3f06aaa453bd5d
         run: |
           git clone --recursive https://github.com/SeedSigner/seedsigner-os.git seedsigner-os
+          cd seedsigner-os
+          git checkout "${SEEDSIGNER_OS_COMMIT}"
+          git submodule update --init --recursive
 
       - name: build image
         working-directory: seedsigner-os
@@ -56,10 +71,24 @@ jobs:
       - name: list image
         run: ls -la seedsigner-os/images
 
+      - name: checksum image
+        # SeedSigner's own signed releases publish a checksum for exactly
+        # this reason: flashing an unverifiable image bypasses that whole
+        # chain. This workflow builds an image outside that chain (a
+        # patched fork, not an official release), so publishing a
+        # checksum alongside it is the minimum an operator needs to
+        # confirm the .img artifact they download is byte-for-byte what
+        # this specific build produced, before flashing real custody
+        # hardware with it.
+        working-directory: seedsigner-os/images
+        run: sha256sum *.img | tee SHA256SUMS
+
       - name: upload image
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2, pinned by SHA not a mutable tag
         with:
           name: seedsigner-image
-          path: seedsigner-os/images/*.img
+          path: |
+            seedsigner-os/images/*.img
+            seedsigner-os/images/SHA256SUMS
           if-no-files-found: error
           retention-days: 14

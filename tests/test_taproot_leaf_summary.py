@@ -136,10 +136,10 @@ def _build_founders_and_timelocked_recovery_psbt(seed_a: Seed, seed_b: Seed, see
 
 class TestSigningLeafSummary:
     """
-    2026-08-07: the last piece of the taproot confirm-screen work -- a
-    human-readable (well, human-readable at the VIEW layer; this model
-    returns raw facts) description of which spending path a seed is about
-    to sign. Deliberately split into two honesty tiers: WITH a registered
+    get_signing_leaf_summary produces a human-readable (well,
+    human-readable at the VIEW layer; this model returns raw facts)
+    description of which spending path a seed is about to sign.
+    Deliberately split into two honesty tiers: WITH a registered
     descriptor, the signing leaf is matched against the wallet's own real
     tap tree and its true position + quorum are reported, read from the
     descriptor's PARSED miniscript AST (never decompiled from raw script
@@ -211,6 +211,28 @@ class TestSigningLeafSummary:
         assert summary["quorum_k"] is None
         assert summary["quorum_n"] is None
         assert summary["timelock_kind"] is None
+
+    def test_result_is_memoized_per_registered_descriptor(self):
+        """get_signing_leaf_summary is invoked as a cheap truthiness
+        check at several routing/render call sites (PSBTOverviewView,
+        PSBTSpendPathView, PSBTKeyPathSpendView) for the SAME PSBT
+        review -- it must not redo the descriptor derivation + tap-tree
+        walk from scratch on every call. Same descriptor instance twice
+        must return the exact same (identity, not just equal) dict; a
+        different descriptor instance must get its own independently
+        computed entry."""
+        psbt, descriptor = _build_founders_and_timelocked_recovery_psbt(
+            self.seed_a, self.seed_b, self.seed_c, signing_leaf="founders"
+        )
+        parser = PSBTParser(psbt, self.seed_a, network=SettingsConstants.REGTEST)
+
+        first = parser.get_signing_leaf_summary(descriptor)
+        second = parser.get_signing_leaf_summary(descriptor)
+        assert first is second
+
+        no_descriptor_result = parser.get_signing_leaf_summary(None)
+        assert no_descriptor_result is not first
+        assert no_descriptor_result["leaf_index"] is None  # the no-descriptor tier, correctly NOT cached onto the registered-descriptor entry
 
     def test_a_different_registered_wallet_does_not_falsely_claim_a_position(self):
         """The registered descriptor doesn't match THIS PSBT's leaf at
@@ -304,6 +326,91 @@ class TestSigningLeafSummary:
         )
         assert PSBTParser._parse_leaf_quorum(timelock_first) == (2, 2, "older_blocks", 144)
         assert PSBTParser._parse_leaf_quorum(quorum_first) == (2, 2, "older_blocks", 144)
+
+
+class TestSigningLeafSummaryBranchPositionResolution:
+    """
+    Round-2 audit finding: get_signing_leaf_summary used to pass the raw
+    PSBT-claimed branch child NUMBER straight through as embit's
+    branch_index, which is actually a POSITIONAL index into the
+    descriptor's own multipath list (AllowedDerivation.fill does
+    `arr[i] = el[branch_index]`). The two only coincide for the
+    conventional <0;1> ordering; a <1;0> descriptor (unusual but valid --
+    nothing in the descriptor spec requires <0;1> ordering) would derive
+    the WRONG child and silently fail to match its own signing leaf.
+    """
+
+    seed_a = PSBTTestData.seed
+    seed_b = PSBTTestData.multisig_key_2
+
+    def test_reversed_multipath_branch_order_still_resolves_correctly(self):
+        """A <1;0> multipath descriptor: branch value 1 sits at POSITION
+        0, value 0 at position 1 -- reversed from the conventional
+        <0;1>. The PSBT's real signing derivation claims branch value 1
+        (position 0). The pre-fix code passed the raw claimed value (1)
+        straight through as branch_index, which embit would read as
+        POSITION 1 -- value 0 for this descriptor -- deriving the wrong
+        child entirely and failing to match the real leaf hash at all."""
+        embit_network = NETWORKS[SettingsConstants.map_network_to_embit(SettingsConstants.REGTEST)]
+        root_a = bip32.HDKey.from_seed(self.seed_a.seed_bytes, version=embit_network["xprv"])
+        root_b = bip32.HDKey.from_seed(self.seed_b.seed_bytes, version=embit_network["xprv"])
+        fp_a = root_a.my_fingerprint
+
+        account_xpub_a = root_a.derive(ACCOUNT_PATH).to_public()
+        account_xpub_b = root_b.derive(ACCOUNT_PATH).to_public()
+        keys = (
+            f"[{fp_a.hex()}/86h/1h/0h]{account_xpub_a.to_base58()}/<1;0>/*,"
+            f"[{root_b.my_fingerprint.hex()}/86h/1h/0h]{account_xpub_b.to_base58()}/<1;0>/*"
+        )
+        descriptor = Descriptor.from_string(f"tr({NUMS_HEX},{{multi_a(2,{keys})}})")
+
+        # Real signing derivation: the PSBT claims branch VALUE 1 (which
+        # is at POSITION 0 in this reversed <1;0> list) and address
+        # index 3.
+        signing_derivation_path = ACCOUNT_PATH + [1, 3]
+        key_a = root_a.derive(signing_derivation_path)
+
+        derived = descriptor.derive(3, branch_index=0)  # position 0 == value 1 for <1;0>
+        script_pubkey = derived.script_pubkey()
+        leaves_with_paths, merkle_root = _tweak_helper(derived.taptree)
+        leaf, path = leaves_with_paths[0]
+        raw_script_bytes = leaf.miniscript.compile()
+        leaf_hash = hashes.tagged_hash("TapLeaf", bytes([leaf.version]) + Script(raw_script_bytes).serialize())
+        control_block = bytes([leaf.version]) + bytes.fromhex(NUMS_HEX) + path
+
+        prevout = TransactionOutput(100_000_000, script_pubkey)
+        tx_in = TransactionInput(bytes(32), 0)
+        tx_out = TransactionOutput(99_990_000, script_pubkey)
+        p = PSBT(Transaction(vin=[tx_in], vout=[tx_out]))
+        inp = p.inputs[0]
+        inp.witness_utxo = prevout
+        inp.taproot_internal_key = ec.PublicKey.from_xonly(bytes.fromhex(NUMS_HEX))
+        inp.taproot_merkle_root = merkle_root
+        inp.taproot_scripts[control_block] = raw_script_bytes + bytes([leaf.version])
+        inp.taproot_bip32_derivations[key_a.to_public()] = ([leaf_hash], DerivationPath(fp_a, signing_derivation_path))
+
+        parser = PSBTParser(p, self.seed_a, network=SettingsConstants.REGTEST)
+        summary = parser.get_signing_leaf_summary(registered_descriptor=descriptor)
+
+        assert summary is not None
+        assert summary["leaf_index"] == 1, "must actually match the leaf -- the pre-fix bug would derive the wrong branch and fail to match at all"
+        assert summary["quorum_k"] == 2 and summary["quorum_n"] == 2
+
+    def test_branch_value_not_in_descriptors_multipath_is_skipped_not_guessed(self):
+        """A PSBT record claiming a branch child value the registered
+        descriptor's multipath list doesn't even contain (e.g. value 2
+        against a <0;1> descriptor) must be skipped, not misresolved to
+        some default branch."""
+        embit_network = NETWORKS[SettingsConstants.map_network_to_embit(SettingsConstants.REGTEST)]
+        root_a = bip32.HDKey.from_seed(self.seed_a.seed_bytes, version=embit_network["xprv"])
+        account_xpub_a = root_a.derive(ACCOUNT_PATH).to_public()
+        fp_a = root_a.my_fingerprint
+        descriptor = Descriptor.from_string(
+            f"tr({NUMS_HEX},{{pk([{fp_a.hex()}/86h/1h/0h]{account_xpub_a.to_base58()}/<0;1>/*)}})"
+        )
+        assert PSBTParser._resolve_branch_position(descriptor, 2) is None
+        assert PSBTParser._resolve_branch_position(descriptor, 0) == 0
+        assert PSBTParser._resolve_branch_position(descriptor, 1) == 1
 
 
 class TestPSBTOverviewRoutingToSpendPathView:
@@ -458,6 +565,47 @@ class TestKeyPathSpendDetection:
 
         parser = PSBTParser(p, self.seed_a, network=SettingsConstants.REGTEST)
         assert parser.signing_key_path is False
+
+    def test_keypath_spend_via_raw_undeprived_root_key_is_flagged(self):
+        """embit's sign_with() tries the RAW, UNDERIVED master key's
+        key-path tweak FIRST for every taproot input, before it ever
+        looks at taproot_bip32_derivations at all
+        (sign_input_with_tapkey(root, ...) is called unconditionally
+        ahead of the derived_keypairs loop). A PSBT whose internal key
+        literally IS this seed's own master key (no derivation at all --
+        unusual, but embit signs it) must be detected even with NO
+        taproot_bip32_derivations entry for it whatsoever."""
+        embit_network = NETWORKS[SettingsConstants.map_network_to_embit(SettingsConstants.REGTEST)]
+        root_a = bip32.HDKey.from_seed(self.seed_a.seed_bytes, version=embit_network["xprv"])
+        root_b = bip32.HDKey.from_seed(self.seed_b.seed_bytes, version=embit_network["xprv"])
+
+        # A real leaf tree exists (pk(B)) -- there's something to bypass.
+        # Only the tree SHAPE/merkle root is used below; the PSBT's own
+        # internal key is deliberately the raw master root, not the
+        # descriptor's account-level key.
+        desc_str = f"tr({_account_key_str(root_a)},{{pk({_account_key_str(root_b)})}})"
+        descriptor = Descriptor.from_string(desc_str)
+        derived = descriptor.derive(0, branch_index=0)
+        _, merkle_root = _tweak_helper(derived.taptree)
+
+        root_tweaked_xonly = root_a.taproot_tweak(merkle_root).xonly()
+        script_pubkey = Script(b"\x51\x20" + root_tweaked_xonly)
+
+        prevout = TransactionOutput(100_000_000, script_pubkey)
+        tx_in = TransactionInput(bytes(32), 0)
+        tx_out = TransactionOutput(99_990_000, script_pubkey)
+        p = PSBT(Transaction(vin=[tx_in], vout=[tx_out]))
+        inp = p.inputs[0]
+        inp.witness_utxo = prevout
+        inp.taproot_internal_key = root_a.to_public()
+        inp.taproot_merkle_root = merkle_root
+        # No taproot_bip32_derivations entry at all -- the raw root-key
+        # check must not depend on one; the pre-fix code only ever
+        # looked at taproot_bip32_derivations and would have missed this
+        # entirely.
+
+        parser = PSBTParser(p, self.seed_a, network=SettingsConstants.REGTEST)
+        assert parser.signing_key_path is True
 
 
 class TestMultipleLeavesAndEligibleKeyCounting:

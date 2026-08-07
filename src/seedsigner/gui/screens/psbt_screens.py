@@ -764,7 +764,6 @@ class PSBTAddressDetailsScreen(ButtonListScreen):
 class PSBTChangeDetailsScreen(ButtonListScreen):
     amount: int = 0
     address: str = None
-    requires_registered_descriptor: bool = False
     fingerprint: str = None
     derivation_path: str = None
     is_change_derivation_path: bool = True

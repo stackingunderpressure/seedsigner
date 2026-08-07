@@ -1,6 +1,10 @@
 # Must import test base before the Controller
 from base import FlowTest, FlowStep
 
+from unittest.mock import MagicMock, patch
+
+from embit.descriptor import Descriptor
+
 from seedsigner.controller import Controller
 from seedsigner.gui.screens.screen import RET_CODE__BACK_BUTTON, ButtonOption
 from seedsigner.models.seed import Seed
@@ -273,6 +277,71 @@ class TestToolsFlows(FlowTest):
             FlowStep(tools_views.ToolsAddressExplorerAddressView),  # runs until dismissed; no ret value
             FlowStep(tools_views.ToolsAddressExplorerAddressListView),
         ])
+
+
+    def test__address_explorer__fixed_non_wildcard_descriptor_never_offers_next(self):
+        """
+            Round-2 audit finding: a fixed (non-wildcard) descriptor --
+            e.g. a DynastyTrust-style single, immutable-address taproot
+            wallet -- resolves to exactly ONE address regardless of
+            index. The list view used to still offer a "Next" button
+            that, if clicked, REPLACED (not appended to) the paginated
+            address cache, relabeling that SAME address under a
+            fabricated, ever-increasing index forever. Calls the view
+            directly (rather than through run_sequence's FlowStep DSL,
+            which only checks which View class comes next, not what got
+            passed to the Screen) so the exact kwargs the Screen would
+            have rendered -- and the exact cache state -- can be
+            inspected: the bug was a silent mislabeling, not a crash or a
+            wrong View transition, so only inspecting those kwargs
+            actually catches it.
+        """
+        controller = Controller.get_instance()
+        descriptor = Descriptor.from_string(
+            # Fixed (no wildcard `*` anywhere), single-sig taproot -- same
+            # key reused from the single-sig segwit test above, just a
+            # bare `/0/0` suffix instead of `/0/*`.
+            "tr([73c5da0a/86h/1h/0h]tpubDC5FSnBiZDMmhiuCmWAYsLwgLYrrT9rAqvTySfuCCrgsWz8wxMXUS9Tb9iVMvcRbvFcAHGkMD5Kx8koh4GquNGNTfohfk7pgjhaPCdXpoba/0/0)"
+        )
+        assert descriptor.is_wildcard is False
+        controller.address_explorer_data = dict(
+            wallet_descriptor=descriptor,
+            embit_network=SettingsConstants.map_network_to_embit(SettingsConstants.MAINNET),
+        )
+
+        def run_view_and_capture_screen_kwargs(view):
+            # Some views reach into their Screen's variables directly
+            # (e.g. to preserve scroll position), so it needs a mock
+            # Screen instance -- same pattern FlowTest.run_sequence uses.
+            view.screen = MagicMock()
+            with patch.object(view, "run_screen", return_value=0) as mock_run_screen:
+                view.run()
+            return mock_run_screen.call_args.kwargs
+
+        def render_first_page():
+            view = tools_views.ToolsAddressExplorerAddressListView(is_change=False, start_index=0)
+            return run_view_and_capture_screen_kwargs(view)
+
+        first_page_kwargs = render_first_page()
+        assert first_page_kwargs["show_next_button"] is False
+        assert len(first_page_kwargs["addresses"]) == 1
+        assert controller.address_explorer_data["receive_addrs"] == first_page_kwargs["addresses"]
+
+        # Simulate the pre-fix bug's trigger directly: re-enter this view
+        # with a start_index a real "Next" click would have produced.
+        # Pre-fix, this REASSIGNED data["receive_addrs"] to a new
+        # 1-element list every time, silently relabeling the same address
+        # under start_index=10, 20, 30... forever. Post-fix, the fixed
+        # branch ignores start_index entirely and still shows it as a
+        # single address at display index 0, with no Next button to have
+        # gotten here from in the first place.
+        second_page_view = tools_views.ToolsAddressExplorerAddressListView(is_change=False, start_index=10)
+        second_page_kwargs = run_view_and_capture_screen_kwargs(second_page_view)
+
+        assert second_page_kwargs["addresses"] == first_page_kwargs["addresses"], "must be the SAME address, not a fabricated new one"
+        assert second_page_kwargs["start_index"] == 0, "must display as index 0 -- not the fabricated start_index=10 the pre-fix code would have shown"
+        assert second_page_kwargs["show_next_button"] is False
+        assert controller.address_explorer_data["receive_addrs"] == first_page_kwargs["addresses"], "cache must still hold exactly the one real address, not have been reset/grown"
 
 
     def test__verify_address__legacy_multisig_p2sh__flow(self):

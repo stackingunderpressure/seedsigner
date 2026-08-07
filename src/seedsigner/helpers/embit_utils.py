@@ -1,4 +1,6 @@
 import embit
+import logging
+import re
 
 from binascii import b2a_base64
 from hashlib import sha256
@@ -11,6 +13,8 @@ from embit.util import secp256k1
 
 
 from seedsigner.models.settings_definition import SettingsConstants
+
+logger = logging.getLogger(__name__)
 
 
 """
@@ -261,11 +265,50 @@ def get_taproot_policy_summary(descriptor: Descriptor) -> dict:
     """
     if not descriptor.is_taproot:
         raise ValueError(f"Expected a taproot descriptor, got: {descriptor.brief_policy}")
+    try:
+        num_leaves = _count_tap_leaves(descriptor.taptree)
+    except ValueError:
+        # _count_tap_leaves' own depth guard raising means the tree is
+        # malformed/adversarial (deeper than BIP341's real 128-leaf cap),
+        # not that this function's caller did anything wrong. Every
+        # caller of this summary (the registration confirmation screen,
+        # Address Explorer's policy display) shows the user a summary
+        # string, not a crash screen -- degrade to "leaves unknown"
+        # rather than letting a scanned QR crash the flow.
+        logger.warning("Tap tree exceeds max depth; treating leaf count as unknown", exc_info=True)
+        num_leaves = 0
     return {
         "num_keys": len(descriptor.keys),
-        "num_leaves": _count_tap_leaves(descriptor.taptree),
+        "num_leaves": num_leaves,
         "keypath_spendable": not is_nums_internal_key(descriptor),
     }
+
+
+
+# Matches a key origin `]` immediately followed by a bare 64-hex-char
+# x-only pubkey (no extended-key prefix like xpub/tpub, since those are
+# base58, not hex) with nothing derivable after it -- e.g.
+# `[fp/86h/1h/0h/0/0]<64 hex chars>`. An xpub-based key expression at the
+# same position instead starts with an alphabetic base58 prefix and can
+# still have `/0/*` appended.
+_BARE_XONLY_LEAF_KEY_RE = re.compile(r'\][0-9a-fA-F]{64}(?:[,)]|$)')
+
+
+def is_bare_taproot_leaf_key_descriptor(descriptor_str: str) -> bool:
+    """
+    True only for a taproot descriptor carrying a leaf key expressed as
+    an already-derived, non-extendable bare x-only pubkey (e.g.
+    `tr(H,{pk([fp/86h/1h/0h/0/0]<64-hex-xonly>)})`) -- the one shape the
+    legacy `/0/*` -> `/{0,1}/*` change-branch rewrite (meant for
+    xpub-based legacy/segwit multisig key expressions) actively corrupts:
+    appending `/{0,1}/*` to a key that can't be derived any further makes
+    Descriptor.from_string raise. An ordinary xpub-based taproot
+    descriptor (e.g. `tr([fp/path]xpub.../0/*)`) is exactly as derivable
+    as a legacy multisig xpub and is NOT this shape -- it should still
+    receive the same rewrite, not be blanket-excluded just because it
+    starts with `tr(`.
+    """
+    return bool(_BARE_XONLY_LEAF_KEY_RE.search(descriptor_str))
 
 
 

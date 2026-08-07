@@ -10,9 +10,13 @@ from dataclasses import dataclass
 from PIL import ImageFont
 from unittest.mock import Mock, patch, MagicMock
 
-from embit import compact
-from embit.psbt import PSBT, OutputScope
+from embit import bip32, compact, ec, hashes as embit_hashes
+from embit.descriptor import Descriptor
+from embit.descriptor.taptree import _tweak_helper
+from embit.networks import NETWORKS
+from embit.psbt import PSBT, DerivationPath, OutputScope
 from embit.script import Script
+from embit.transaction import Transaction, TransactionInput, TransactionOutput
 
 from seedsigner.helpers.version import Version, VersionUtils
 
@@ -291,6 +295,113 @@ def generate_screenshots(locale):
                     yield
 
 
+        # Real, constructed-in-Python taproot PSBTs for PSBTSpendPathView
+        # and PSBTKeyPathSpendView -- the two newest, highest-stakes PSBT
+        # screens (they render runtime-formatted quorum/timelock/leaf-
+        # index strings, exactly the class of content that can overflow
+        # or truncate on a 240x240 display) had no screenshot coverage at
+        # all. Built the same way test_taproot_leaf_summary.py's fixtures
+        # are (real embit BIP341/BIP371 construction, not hand-edited
+        # base64), just inlined here rather than imported cross-package.
+        _NUMS_HEX = "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0"
+        _TAPROOT_ACCOUNT_PATH = [0x80000000 + 86, 0x80000000 + 1, 0x80000000 + 0]  # m/86'/1'/0'
+        _TAPROOT_DERIVATION_PATH = _TAPROOT_ACCOUNT_PATH + [0, 0]
+
+        def _taproot_account_key_str(root):
+            fp = root.my_fingerprint.hex()
+            account_xpub = root.derive(_TAPROOT_ACCOUNT_PATH).to_public()
+            return f"[{fp}/86h/1h/0h]{account_xpub.to_base58()}/0/0"
+
+        def _build_taproot_leaf_signing_psbt(seed_a: Seed, seed_b: Seed):
+            """A real 2-of-2 taproot script-path PSBT (single leaf behind
+            an absolute timelock, NUMS internal key so key-path isn't an
+            alternative) plus its matching registered descriptor, so
+            PSBTSpendPathView renders its enriched tier (leaf index,
+            quorum, timelock) rather than just the bare tier-2 fact."""
+            embit_network = NETWORKS[SettingsConstants.map_network_to_embit(SettingsConstants.MAINNET)]
+            root_a = bip32.HDKey.from_seed(seed_a.seed_bytes, version=embit_network["xprv"])
+            root_b = bip32.HDKey.from_seed(seed_b.seed_bytes, version=embit_network["xprv"])
+            key_a = root_a.derive(_TAPROOT_DERIVATION_PATH)
+            fp_a = root_a.my_fingerprint
+
+            keys = f"{_taproot_account_key_str(root_a)},{_taproot_account_key_str(root_b)}"
+            descriptor = Descriptor.from_string(f"tr({_NUMS_HEX},{{and_v(v:after(500000),multi_a(2,{keys}))}})")
+            derived = descriptor.derive(0, branch_index=0)
+            script_pubkey = derived.script_pubkey()
+            leaves_with_paths, merkle_root = _tweak_helper(derived.taptree)
+            leaf, path = leaves_with_paths[0]
+            raw_script_bytes = leaf.miniscript.compile()
+            leaf_hash = embit_hashes.tagged_hash("TapLeaf", bytes([leaf.version]) + Script(raw_script_bytes).serialize())
+            # Parity bit left at 0 (even) -- PSBTParser never reads the
+            # control block's parity, only the (script, leaf_version)
+            # VALUE this dict entry carries, so an exact parity isn't
+            # needed to exercise the screen honestly.
+            control_block = bytes([leaf.version]) + bytes.fromhex(_NUMS_HEX) + path
+
+            prevout = TransactionOutput(2_500_000, script_pubkey)
+            tx_in = TransactionInput(bytes(32), 0)
+            tx_out = TransactionOutput(2_490_000, script_pubkey)
+            p = PSBT(Transaction(vin=[tx_in], vout=[tx_out]))
+            inp = p.inputs[0]
+            inp.witness_utxo = prevout
+            inp.taproot_internal_key = ec.PublicKey.from_xonly(bytes.fromhex(_NUMS_HEX))
+            inp.taproot_merkle_root = merkle_root
+            inp.taproot_scripts[control_block] = raw_script_bytes + bytes([leaf.version])
+            inp.taproot_bip32_derivations[key_a.to_public()] = ([leaf_hash], DerivationPath(fp_a, _TAPROOT_DERIVATION_PATH))
+
+            return p, descriptor
+
+        def _build_taproot_keypath_spend_psbt(seed_a: Seed, seed_b: Seed):
+            """A taproot wallet whose INTERNAL key is a real, spendable
+            key (signer A), alongside a genuine script-path leaf (pk(B)),
+            signed via the KEY PATH -- bypassing the leaf entirely. For
+            PSBTKeyPathSpendView's screenshot."""
+            embit_network = NETWORKS[SettingsConstants.map_network_to_embit(SettingsConstants.MAINNET)]
+            root_a = bip32.HDKey.from_seed(seed_a.seed_bytes, version=embit_network["xprv"])
+            root_b = bip32.HDKey.from_seed(seed_b.seed_bytes, version=embit_network["xprv"])
+            key_a = root_a.derive(_TAPROOT_DERIVATION_PATH)
+            fp_a = root_a.my_fingerprint
+
+            descriptor = Descriptor.from_string(f"tr({_taproot_account_key_str(root_a)},{{pk({_taproot_account_key_str(root_b)})}})")
+            derived = descriptor.derive(0, branch_index=0)
+            script_pubkey = derived.script_pubkey()
+            _, merkle_root = _tweak_helper(derived.taptree)
+
+            prevout = TransactionOutput(2_500_000, script_pubkey)
+            tx_in = TransactionInput(bytes(32), 0)
+            tx_out = TransactionOutput(2_490_000, script_pubkey)
+            p = PSBT(Transaction(vin=[tx_in], vout=[tx_out]))
+            inp = p.inputs[0]
+            inp.witness_utxo = prevout
+            inp.taproot_internal_key = key_a.to_public()
+            inp.taproot_merkle_root = merkle_root
+            # Key-path claim: EMPTY leaf_hashes -- exactly what a
+            # coordinator populates for an internal-key derivation, as
+            # distinct from a leaf-tied one.
+            inp.taproot_bip32_derivations[key_a.to_public()] = ([], DerivationPath(fp_a, _TAPROOT_DERIVATION_PATH))
+
+            return p
+
+
+        @contextmanager
+        def mock_taproot_leaf_signing_psbt_loaded():
+            psbt, descriptor = _build_taproot_leaf_signing_psbt(seed_12b, seed_12)
+            with patch.object(controller, 'psbt', psbt):
+                with patch.object(controller, 'psbt_seed', seed_12b):
+                    with patch.object(controller, 'psbt_parser', PSBTParser(p=psbt, seed=seed_12b)):
+                        with patch.object(controller, 'multisig_wallet_descriptor', descriptor):
+                            yield
+
+
+        @contextmanager
+        def mock_taproot_keypath_spend_psbt_loaded():
+            psbt = _build_taproot_keypath_spend_psbt(seed_12b, seed_12)
+            with patch.object(controller, 'psbt', psbt):
+                with patch.object(controller, 'psbt_seed', seed_12b):
+                    with patch.object(controller, 'psbt_parser', PSBTParser(p=psbt, seed=seed_12b)):
+                        yield
+
+
         @contextmanager
         def mock_address_verification_data_loaded():
             fake_addr_verification_data = dict(
@@ -439,6 +550,8 @@ def generate_screenshots(locale):
                 ScreenshotConfig(psbt_views.PSBTChangeDetailsView, dict(change_address_num=0), screenshot_name="PSBTChangeDetailsView_multisig_unverified", mock_context_manager=mock_multisig_psbt_loaded),
                 ScreenshotConfig(psbt_views.PSBTChangeDetailsView, dict(change_address_num=0), screenshot_name="PSBTChangeDetailsView_multisig_verified",   mock_context_manager=mock_multisig_psbt_and_descriptor_loaded),
                 ScreenshotConfig(psbt_views.PSBTOverviewView, screenshot_name="PSBTOverviewView_op_return",    mock_context_manager=mock_psbt_with_op_return_loaded),
+                ScreenshotConfig(psbt_views.PSBTSpendPathView, screenshot_name="PSBTSpendPathView_registered_descriptor", mock_context_manager=mock_taproot_leaf_signing_psbt_loaded),
+                ScreenshotConfig(psbt_views.PSBTKeyPathSpendView, screenshot_name="PSBTKeyPathSpendView", mock_context_manager=mock_taproot_keypath_spend_psbt_loaded),
                 ScreenshotConfig(psbt_views.PSBTOpReturnView, screenshot_name="PSBTOpReturnView_text",         mock_context_manager=mock_psbt_with_op_return_loaded),
                 ScreenshotConfig(psbt_views.PSBTOpReturnView, screenshot_name="PSBTOpReturnView_raw_hex_data", mock_context_manager=mock_psbt_with_op_return_raw_bytes_loaded),
                 ScreenshotConfig(psbt_views.PSBTAddressVerificationFailedView, dict(is_change=True, requires_registered_descriptor=False),  screenshot_name="PSBTAddressVerificationFailedView_singlesig_change"),

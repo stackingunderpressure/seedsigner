@@ -540,14 +540,14 @@ class TestTaprootDescriptorRegistration:
         assert embit_utils.is_single_sig_wallet(basic_multisig) is False
 
     def test_get_multisig_address_single_sig_segwit_matches_independent_derivation(self):
-        """The gap this session actually fixed: a plain single-sig wpkh()
-        descriptor exported from another coordinator (e.g. Nunchuk) used to
-        hit get_multisig_address's final `raise` because neither is_segwit's
-        multisig-only guard nor the taproot branch applied to it -- except
-        is_segwit was never multisig-only to begin with; the real blocker
-        was entirely at the routing layer (scan_views.py / tools_views.py),
-        which is what the other assertions in this test file's flow-level
-        tests cover. This test cross-checks the actual math independently:
+        """A plain single-sig wpkh() descriptor exported from another
+        coordinator (e.g. Nunchuk) must derive correctly through
+        get_multisig_address: the routing layer (scan_views.py /
+        tools_views.py, covered by this test file's flow-level tests)
+        decides WHETHER a single-sig descriptor reaches this function at
+        all, but once it does, get_multisig_address's own math has to be
+        right independent of that gate. This test cross-checks the actual
+        math independently:
         derive the expected pubkey/address straight from the xpub via
         embit's own bip32/script primitives (a second, independent code
         path from Descriptor.derive()) and confirm get_multisig_address
@@ -727,3 +727,64 @@ class TestTaprootDescriptorRegistration:
             "wpkh([73c5da0a/84h/1h/0h]tpubDC5FSnBiZDMmhiuCmWAYsLwgLYrrT9rAqvTySfuCCrgsWz8wxMXUS9Tb9iVMvcRbvFcAHGkMD5Kx8koh4GquNGNTfohfk7pgjhaPCdXpoba/{0,1}/*)#2aj6cvca"
         )
         assert embit_utils.is_single_sig_wallet(bare_native_segwit) is True
+
+
+class TestIsBareTaprootLeafKeyDescriptor:
+    """
+    Round-2 audit finding: scan_views.py used to skip the legacy
+    `/0/*` -> `/{0,1}/*` change-branch rewrite for EVERY `tr(`-prefixed
+    descriptor, when the rewrite is only actually unsafe for one narrow
+    shape -- a taproot leaf key expressed as an already-derived, bare
+    x-only pubkey with no further derivation possible. Blanket-excluding
+    every `tr(` descriptor silently broke change verification for a
+    perfectly ordinary xpub-based taproot wildcard export from some
+    other coordinator. This predicate exists to distinguish the two.
+    """
+
+    def test_bare_xonly_leaf_key_is_detected(self):
+        # A DynastyTrust-shaped leaf: [origin]<64-hex-char xonly>, no
+        # further derivation possible.
+        descriptor_str = (
+            "tr(50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0,"
+            "{pk([73c5da0a/86h/1h/0h/0/0]bd17afa027e8cea2a48a6139d7df436446ed49e15883bdfb733ec3ac45799bd1)})"
+        )
+        assert embit_utils.is_bare_taproot_leaf_key_descriptor(descriptor_str) is True
+
+    def test_ordinary_xpub_based_taproot_wildcard_is_not_flagged(self):
+        """The shape the blanket `tr(` exclusion incorrectly also caught
+        -- a plain xpub-based taproot wildcard descriptor is exactly as
+        derivable as a legacy multisig xpub and must still get the
+        legacy rewrite."""
+        descriptor_str = (
+            "tr([73c5da0a/86h/1h/0h]tpubDC5FSnBiZDMmhiuCmWAYsLwgLYrrT9rAqvTySfuCCrgsWz8wxMXUS9Tb9iVMvcRbvFcAHGkMD5Kx8koh4GquNGNTfohfk7pgjhaPCdXpoba/0/*)"
+        )
+        assert embit_utils.is_bare_taproot_leaf_key_descriptor(descriptor_str) is False
+
+    def test_non_taproot_descriptor_is_not_flagged(self):
+        descriptor_str = "wpkh([73c5da0a/84h/1h/0h]tpubDC5FSnBiZDMmhiuCmWAYsLwgLYrrT9rAqvTySfuCCrgsWz8wxMXUS9Tb9iVMvcRbvFcAHGkMD5Kx8koh4GquNGNTfohfk7pgjhaPCdXpoba/0/*)"
+        assert embit_utils.is_bare_taproot_leaf_key_descriptor(descriptor_str) is False
+
+
+class TestGetTaprootPolicySummaryDepthGuardContainment:
+    """
+    Round-2 audit finding: _count_tap_leaves' own depth guard correctly
+    RAISES ValueError on a malformed/adversarial tap tree deeper than
+    BIP341's real 128-leaf cap, but nothing in its caller chain caught
+    it -- a hostile descriptor would crash the registration confirmation
+    screen instead of degrading. get_taproot_policy_summary is the one
+    place all of that caller chain funnels through, so containment
+    belongs there.
+    """
+
+    def test_depth_guard_exception_degrades_to_zero_leaves_rather_than_propagating(self):
+        from embit.descriptor import Descriptor
+        from unittest.mock import patch
+
+        descriptor = Descriptor.from_string(
+            "tr(50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0,"
+            "{pk([73c5da0a/86h/1h/0h/0/0]bd17afa027e8cea2a48a6139d7df436446ed49e15883bdfb733ec3ac45799bd1)})"
+        )
+        with patch.object(embit_utils, "_count_tap_leaves", side_effect=ValueError("Tap tree exceeds BIP341's maximum depth -- malformed descriptor")):
+            summary = embit_utils.get_taproot_policy_summary(descriptor)
+        assert summary["num_leaves"] == 0
+        assert summary["num_keys"] == len(descriptor.keys)

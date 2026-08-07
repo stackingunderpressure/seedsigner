@@ -2033,7 +2033,7 @@ def get_descriptor_policy_display_name(descriptor) -> str:
     helpers this calls (get_taproot_policy_summary, get_multisig_policy)
     return raw data only.
     """
-    from seedsigner.helpers.embit_utils import get_taproot_policy_summary, get_multisig_policy
+    from seedsigner.helpers.embit_utils import get_taproot_policy_summary, get_multisig_policy, is_single_sig_wallet
 
     if descriptor.is_taproot:
         summary = get_taproot_policy_summary(descriptor)
@@ -2052,16 +2052,36 @@ def get_descriptor_policy_display_name(descriptor) -> str:
             keypath=keypath_note,
         )
 
-    elif len(descriptor.keys) == 1:
-        # Single-sig (legacy/nested/native segwit) -- get_multisig_policy
-        # only knows how to express an M-of-N threshold and intentionally
+    elif is_single_sig_wallet(descriptor):
+        # BARE single-sig (legacy/nested/native segwit, no miniscript
+        # policy wrapped around the key) -- get_multisig_policy only
+        # knows how to express an M-of-N threshold and intentionally
         # raises for anything else, so this has to be checked first.
+        # Deliberately NOT the weaker `len(descriptor.keys) == 1` check
+        # this replaces: a single KEY doesn't mean a single-sig POLICY --
+        # wsh(and_v(v:older(144),pk(A))) has exactly one key but is a
+        # timelocked vault, and labelling it "Single-sig" would hide the
+        # very condition a user is being asked to confirm (see
+        # is_single_sig_wallet's own docstring, which this exact display
+        # helper had drifted out of sync with).
         return _("Single-sig")
 
-    else:
+    elif descriptor.is_basic_multisig:
         threshold, n = get_multisig_policy(descriptor)
         # TRANSLATOR_NOTE: Multisig policy. For a "2 of 3" policy, "threshold" = 2; "n" = 3
         return _("{threshold} of {n}").format(threshold=threshold, n=n)
+
+    else:
+        # A non-taproot miniscript policy shape this summary doesn't know
+        # how to describe precisely (e.g. a single-key timelocked vault).
+        # scan_views.py's registration gate already rejects shapes like
+        # this before they can reach here, but this function is also
+        # called directly by Address Explorer, and a future caller with
+        # no such gate must not get a WRONG label (mislabeling this
+        # "Single-sig" is exactly the bug the branch above exists to
+        # avoid) or a crash (get_multisig_policy raises for anything
+        # that isn't basic multisig).
+        return _("Custom policy")
 
 
 
@@ -2101,6 +2121,17 @@ class MultisigWalletDescriptorView(View):
 
         fingerprints = []
         for key in descriptor.keys:
+            if key.fingerprint is None:
+                # A bare taproot internal key with no [fp/path] origin --
+                # e.g. DynastyTrust's own NUMS-point shape,
+                # tr(<64-hex-xonly>,{...}) -- has no signer fingerprint
+                # to show at all; it isn't a signer, it's the (usually
+                # deliberately unspendable) internal key. Without this
+                # guard, hexlify(None) raises TypeError and registering
+                # ANY such descriptor -- the exact real-world shape this
+                # fork's taproot support exists for -- crashes this
+                # screen outright.
+                continue
             fingerprint = hexlify(key.fingerprint).decode()
             fingerprints.append(fingerprint)
 
@@ -2129,10 +2160,19 @@ class MultisigWalletDescriptorView(View):
             return Destination(BackStackView)
         
         elif button_data[selected_menu_num] == self.RETURN:
-            # Jump straight back to PSBT change verification
-            from seedsigner.views.psbt_views import PSBTChangeDetailsView
+            # Re-run the same taproot key-path/leaf disclosure check
+            # PSBTOverviewView makes right after its own screen closes --
+            # not a bare jump to PSBTChangeDetailsView. A descriptor was
+            # just registered, which is exactly the data
+            # get_signing_leaf_summary needs to show which leaf, what
+            # quorum, and what timelock this PSBT is really signing; a
+            # direct jump here would permanently skip that disclosure on
+            # this, the most common real registration journey (scan a
+            # PSBT with no descriptor registered yet, land in change
+            # verification, register one from there, return).
+            from seedsigner.views.psbt_views import PSBTOverviewView
             self.controller.resume_main_flow = None
-            return Destination(PSBTChangeDetailsView, view_args=dict(change_address_num=0))
+            return PSBTOverviewView._route_after_overview(self.controller.psbt_parser, descriptor)
 
         elif button_data[selected_menu_num].button_label.startswith(_(self.VERIFY_ADDR.button_label)):
             self.controller.resume_main_flow = None

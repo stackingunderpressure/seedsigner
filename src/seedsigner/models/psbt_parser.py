@@ -14,6 +14,31 @@ from seedsigner.models.settings import SettingsConstants
 
 logger = logging.getLogger(__name__)
 
+# These are private/internal embit symbols this module relies on for
+# taproot tree-walking and miniscript introspection. Imported once here,
+# at module load, rather than inline inside the functions that use them:
+# an inline import only fails the FIRST TIME that specific code path
+# runs, deep inside a signing/confirm flow, turning a simple embit
+# version bump into a hard crash mid-flow instead of a clean, guarded
+# degradation. If a future embit relocates or renames either symbol,
+# these become None and every caller below treats that as "can't walk
+# the tree" / "can't recognize this shape" -- the same honest
+# can't-prove-it degradation already used for a malformed/adversarial
+# tap tree -- rather than an unhandled ImportError.
+try:
+    from embit.descriptor.taptree import _tweak_helper
+except ImportError:
+    logger.warning("embit.descriptor.taptree._tweak_helper not found; taproot leaf-tree detail will be unavailable", exc_info=True)
+    _tweak_helper = None
+
+try:
+    from embit.descriptor.miniscript import (
+        AndV, V, After, Older, MultiA, Multi, Sortedmulti, SortedmultiA, Pk,
+    )
+except ImportError:
+    logger.warning("embit.descriptor.miniscript AST classes not found; taproot leaf quorum/timelock detail will be unavailable", exc_info=True)
+    AndV = V = After = Older = MultiA = Multi = Sortedmulti = SortedmultiA = Pk = None
+
 class OPCODES:
     OP_RETURN = 106
     OP_PUSHDATA1 = 76
@@ -70,6 +95,17 @@ class PSBTParser():
         self.signing_key_path = False
 
         self.root = None
+        self._our_fingerprint = None
+
+        # Memoizes get_signing_leaf_summary() per registered_descriptor
+        # instance. That call does a full descriptor derivation plus a
+        # tap-tree walk, and it's invoked as a cheap truthiness check at
+        # several routing/render call sites (PSBTOverviewView,
+        # PSBTSpendPathView, PSBTKeyPathSpendView) for the SAME PSBT
+        # review -- the underlying facts (signing_leaf_records, the
+        # registered descriptor) never change mid-review, so recomputing
+        # from scratch each time is pure waste, not correctness.
+        self._signing_leaf_summary_cache = {}
 
         if self.seed is not None:
             self.parse()
@@ -100,6 +136,12 @@ class PSBTParser():
 
     def _set_root(self):
         self.root = bip32.HDKey.from_seed(self.seed.seed_bytes, version=NETWORKS[SettingsConstants.map_network_to_embit(self.network)]["xprv"])
+        # Computed once here rather than per-input/per-output: this is a
+        # full EC child derivation plus hash160, and several call sites
+        # (each taproot input's signing-path detection, output-side
+        # change recognition, the fingerprint-repair pass) all want the
+        # same value for the same PSBT.
+        self._our_fingerprint = self.root.child(0).fingerprint
 
 
     def parse(self):
@@ -145,8 +187,24 @@ class PSBTParser():
                 if self.policy != inp_policy:
                     raise RuntimeError("Mixed inputs in the transaction")
 
-            if inp.is_taproot and inp.utxo is not None:
-                self._detect_taproot_signing_path(inp)
+            if inp.is_taproot:
+                try:
+                    self._detect_taproot_signing_path(inp)
+                except Exception:
+                    # Fail closed for THIS input's signing-path detection
+                    # (leaves signing_key_path/signing_leaf_* exactly as
+                    # they were before this input) rather than crashing
+                    # the whole PSBT parse over one malformed/adversarial
+                    # input's tap-tree metadata -- the same containment
+                    # already used by _parse_outputs and
+                    # get_signing_leaf_summary for the identical class of
+                    # risk (attacker-supplied taproot data). Note: an
+                    # input with is_taproot True but no utxo attached
+                    # already raises inside is_taproot itself (it
+                    # dereferences inp.utxo first), a pre-existing
+                    # upstream gap this container also now catches
+                    # instead of propagating.
+                    logger.warning("Could not evaluate taproot signing path for an input", exc_info=True)
 
     def _detect_taproot_signing_path(self, inp):
         """
@@ -170,6 +228,14 @@ class PSBTParser():
         Never trusts the PSBT's claimed pubkey either -- as with output
         change recognition, a candidate key is only trusted once it's
         re-derived from OUR OWN seed and matches the claim.
+
+        Also reproduces the one candidate embit's sign_with() checks
+        BEFORE it ever looks at taproot_bip32_derivations: the raw,
+        UNDERIVED master key itself (sign_input_with_tapkey(root, ...) is
+        called unconditionally, ahead of the derived_keypairs loop). A
+        PSBT whose internal key literally IS this seed's own master key
+        (no derivation at all) would otherwise be invisible to this
+        detector even though embit would sign it via the key path.
         """
         output_script = inp.utxo.script_pubkey.data
         merkle_root = inp.taproot_merkle_root or b""
@@ -178,14 +244,33 @@ class PSBTParser():
         # our seed, so by this point a non-matching fingerprint reliably
         # means "not ours" -- a cheap pre-filter before the EC-heavy
         # derive() call below.
-        our_fingerprint = self.root.child(0).fingerprint
+        our_fingerprint = self._our_fingerprint
+
+        root_tweaked = self.root.taproot_tweak(merkle_root)
+        if root_tweaked.xonly() in output_script and merkle_root:
+            self.signing_key_path = True
 
         for pub, (_claimed_leaf_hashes, derivation) in inp.taproot_bip32_derivations.items():
             if derivation.fingerprint != our_fingerprint:
                 continue
             candidate = self.root.derive(derivation.derivation)
             if candidate.to_public().xonly() != pub.xonly():
-                continue  # claimed key doesn't actually derive from our seed
+                # Our own fingerprint is claimed but the derived key
+                # doesn't match the claimed pubkey. embit's own
+                # sign_with() treats this exact condition as fatal for
+                # the whole PSBT (raises PSBTError("Derivation path
+                # doesn't look right")). This detector stays fail-closed
+                # instead -- skip this candidate, assert nothing about it
+                # -- rather than crashing the whole confirm-screen flow
+                # over it, but the mismatch is logged so it's
+                # diagnosable: silence here would otherwise hide a
+                # condition that could still surface later as an
+                # unexplained finalize failure.
+                logger.warning(
+                    "Taproot input claims our fingerprint (%s) but the derived key at %s doesn't match the claimed pubkey",
+                    our_fingerprint.hex(), bip32.path_to_str(derivation.derivation),
+                )
+                continue
 
             # Key-path check first, exactly as embit's
             # sign_input_with_tapkey does.
@@ -214,8 +299,21 @@ class PSBTParser():
                 leaf_hash = hashes.tagged_hash("TapLeaf", bytes([leaf_version]) + leaf_script.serialize())
                 self.signing_leaf_hashes.add(leaf_hash)
                 self.signing_leaf_pubkeys.add(candidate_xonly)
+                # signing_leaf_records additionally needs a real (branch,
+                # address) pair to later re-derive this leaf against a
+                # registered descriptor (see get_signing_leaf_summary) --
+                # unlike the two sets above, which only need to prove a
+                # leaf exists at all, a path shorter than 2 elements has
+                # no branch/index component to record. raw_branch_value
+                # is the PSBT's literal child NUMBER at that position
+                # (e.g. the 0 or 1 in a <0;1> derivation), NOT yet the
+                # embit branch_index POSITION -- see
+                # _resolve_branch_position, which get_signing_leaf_summary
+                # uses to convert it before calling Descriptor.derive().
                 if len(derivation.derivation) >= 2:
-                    self.signing_leaf_records.append((leaf_hash, derivation.derivation[-2], derivation.derivation[-1]))
+                    raw_branch_value = derivation.derivation[-2]
+                    address_index = derivation.derivation[-1]
+                    self.signing_leaf_records.append((leaf_hash, raw_branch_value, address_index))
 
 
     def _parse_outputs(self):
@@ -305,6 +403,18 @@ class PSBTParser():
                             real_output_script = b"\x51\x20" + output_xonly
                             if real_output_script == self.psbt.tx.vout[i].script_pubkey.data:
                                 for pub, (claimed_leaves, derivation) in out.taproot_bip32_derivations.items():
+                                    if derivation.fingerprint != self._our_fingerprint:
+                                        # Same pre-filter _detect_taproot_signing_path
+                                        # applies on the input side: a
+                                        # non-matching fingerprint means
+                                        # "not ours," so skip the EC-heavy
+                                        # derive() call below rather than
+                                        # running it unconditionally for
+                                        # every claimed entry an output
+                                        # carries -- the input side had
+                                        # this filter, this output-side
+                                        # loop didn't.
+                                        continue
                                     candidate = self.root.derive(derivation.derivation)
                                     candidate_xonly = candidate.to_public().xonly()
                                     if candidate_xonly != pub.xonly():
@@ -329,9 +439,6 @@ class PSBTParser():
                             der = derivation.derivation
                             my_pubkey = self.root.derive(der)
                             sc = script.p2tr(my_pubkey)
-
-                        if sc.data == self.psbt.tx.vout[i].script_pubkey.data:
-                            is_change = True
 
                 if sc.data == self.psbt.tx.vout[i].script_pubkey.data:
                     is_change = True
@@ -679,23 +786,28 @@ class PSBTParser():
         change_data = self.get_change_data(change_num)
         i = change_data["output_index"]
         output = self.psbt.outputs[i]
+        real_output_script = self.psbt.tx.vout[i].script_pubkey
 
-        if descriptor.is_taproot and not descriptor.is_wildcard:
+        if not descriptor.is_wildcard:
             # embit 0.8.0's AllowedDerivation.check_derivation() (what
             # Descriptor.owns() relies on to match a PSBT's claimed
             # derivation against a registered key) only reports a match
             # when the key's allowed-derivation suffix contains a
             # wildcard: it only sets its `idx` return value inside the
-            # wildcard branch of its loop, so a FIXED suffix like
-            # DynastyTrust's own [fp/path]xpub/0/0 descriptors (no `*`
-            # at all -- see get_multisig_address's taproot branch above)
-            # leaves `idx` at None even on an exact index match, and
-            # owns() always reports False regardless of whether the
-            # output is really ours. A fully fixed (non-wildcard)
-            # taproot descriptor only ever resolves to ONE address --
-            # derive() at any index/branch is a proven no-op for it --
-            # so comparing that address's script directly against the
-            # real output is both sufficient and immune to this embit
+            # wildcard branch of its loop, so ANY fixed (non-wildcard)
+            # descriptor -- taproot or not, e.g. DynastyTrust's own
+            # [fp/path]xpub/0/0 shape (see get_multisig_address's taproot
+            # branch above) -- leaves `idx` at None even on an exact
+            # index match, and owns() always reports False regardless of
+            # whether the output is really ours. This bug is
+            # script-type-agnostic, not taproot-specific: gating this
+            # workaround on is_taproot alone (the original fix) left
+            # every non-taproot fixed descriptor exposed to the identical
+            # failure. A fully fixed (non-wildcard) descriptor only ever
+            # resolves to a small, enumerable set of addresses -- one per
+            # multipath branch position, if any -- so comparing each
+            # candidate address's script directly against the real
+            # output is both sufficient and immune to this embit
             # limitation. Wildcard descriptors are unaffected by the bug
             # (a real wildcard element does set `idx`) and keep using
             # owns() below.
@@ -705,17 +817,75 @@ class PSBTParser():
             # carrying a fixed-index multipath branch (e.g. `<0;1>/5`,
             # is_wildcard False but the branch still varies). derive() is
             # only a proven no-op across the INDEX for such a descriptor,
-            # not across branch_index -- so try both branches rather than
-            # hardcoding branch 0, which would falsely report
-            # verification failed for genuine change landing on branch 1.
-            for branch_index in (0, 1):
-                if descriptor.derive(0, branch_index=branch_index).script_pubkey() == output.script_pubkey:
+            # not across branch_index -- so try every branch POSITION the
+            # descriptor's own key(s) actually declare (see
+            # _multipath_branch_count) rather than hardcoding two, which
+            # would silently miss a 3-or-more-way multipath and would
+            # falsely report verification failed for genuine change
+            # landing on a branch beyond the first two.
+            for branch_index in range(PSBTParser._multipath_branch_count(descriptor)):
+                if descriptor.derive(0, branch_index=branch_index).script_pubkey() == real_output_script:
                     return True
             return False
 
         is_owner = descriptor.owns(output)
         # print(f"{self.psbt.tx.vout[i].script_pubkey.address()} | {output.value} | {is_owner}")
         return is_owner
+
+
+    @staticmethod
+    def _descriptor_branches(descriptor: Descriptor):
+        """
+        Returns the descriptor's declared multipath branch list (e.g.
+        [0, 1] for a `<0;1>` suffix), or None if none of its keys carry
+        one. All keys in a tr_multileaf-style policy share the same
+        multipath suffix, so the first key that has one speaks for the
+        whole descriptor.
+        """
+        for key in descriptor.keys:
+            allowed = getattr(key, "allowed_derivation", None)
+            branches = allowed.branches if allowed is not None else None
+            if branches:
+                return branches
+        return None
+
+
+    @staticmethod
+    def _resolve_branch_position(descriptor: Descriptor, raw_branch_value: int):
+        """
+        Converts a PSBT's raw multipath branch child NUMBER (e.g. the
+        literal 0 or 1 from a <0;1> derivation) into the POSITIONAL
+        index embit's AllowedDerivation.fill()/Descriptor.derive(
+        branch_index=...) actually expects. embit indexes branch_index
+        POSITIONALLY into the descriptor's own multipath list
+        (`arr[i] = el[branch_index]`), NOT by the branch's literal child
+        value -- the two only coincide for the conventional `<0;1>`
+        ordering. For a `<1;0>` descriptor, the raw value 1 is at
+        position 0, not position 1; passing the raw value straight
+        through as branch_index would derive the WRONG child.
+
+        Returns None (rather than guessing) if the descriptor declares a
+        multipath branch list and raw_branch_value isn't a member of it
+        -- that means this PSBT record doesn't actually correspond to
+        this registered descriptor's branch structure at all, and
+        callers should skip the record rather than assert a leaf match
+        that was never really proven. Returns 0 (embit's own default
+        branch) for a descriptor with no multipath branch list, matching
+        derive()'s behavior when branch_index is irrelevant.
+        """
+        branches = PSBTParser._descriptor_branches(descriptor)
+        if branches is None:
+            return 0
+        if raw_branch_value in branches:
+            return branches.index(raw_branch_value)
+        return None
+
+
+    @staticmethod
+    def _multipath_branch_count(descriptor: Descriptor) -> int:
+        """Number of branch POSITIONS this descriptor's multipath list declares (1 if it has none)."""
+        branches = PSBTParser._descriptor_branches(descriptor)
+        return len(branches) if branches else 1
 
 
     def _fill_missing_fingerprints(self):
@@ -734,7 +904,7 @@ class PSBTParser():
         
         def _fill_scope(scope: InputScope | OutputScope):
             """Helper function to fill missing fingerprints in a scope (input/output)"""
-            signing_seed_fingerprint = self.root.child(0).fingerprint
+            signing_seed_fingerprint = self._our_fingerprint
             
             # Helper function to check and fix fingerprint
             def _get_updated_fingerprint(public_key: PublicKey, derivation_path_obj: DerivationPath) -> DerivationPath | None:
@@ -827,10 +997,23 @@ class PSBTParser():
                 "timelock_kind": "after_height" | "after_time" | "older_blocks" | "older_time" | None,
                 "timelock_value": int | None,             # blocks for *_height/*_blocks; seconds for *_time
             }
+
+        Memoized per distinct registered_descriptor instance: this is
+        invoked as a cheap truthiness check at several routing/render
+        call sites (PSBTOverviewView, PSBTSpendPathView,
+        PSBTKeyPathSpendView) for the same PSBT review, and the result
+        for a given descriptor never changes mid-review.
         """
         if not self.signing_leaf_hashes:
             return None
 
+        cache_key = id(registered_descriptor)
+        if cache_key not in self._signing_leaf_summary_cache:
+            self._signing_leaf_summary_cache[cache_key] = self._compute_signing_leaf_summary(registered_descriptor)
+        return self._signing_leaf_summary_cache[cache_key]
+
+
+    def _compute_signing_leaf_summary(self, registered_descriptor: Descriptor) -> dict:
         summary = {
             "num_eligible_keys": len(self.signing_leaf_pubkeys),
             "multiple_leaves": False,
@@ -842,46 +1025,58 @@ class PSBTParser():
             "timelock_value": None,
         }
 
-        if registered_descriptor is None or not registered_descriptor.is_taproot:
+        if registered_descriptor is None or not registered_descriptor.is_taproot or _tweak_helper is None:
             return summary
 
-        from embit.descriptor.taptree import _tweak_helper
-
-        # Cache derived-tree leaves per (branch_index, address_index) so a
+        # Cache derived-tree leaves (each with its real BIP341 hash
+        # precomputed once) per (branch_position, address_index) so a
         # multi-input PSBT signing several leaves at the same child
-        # doesn't re-derive/re-walk the whole tree once per leaf record.
+        # doesn't re-derive/re-walk the whole tree, or re-hash the same
+        # leaves, once per signing_leaf_records entry that shares it.
         derived_leaves_cache = {}
         matched_leaf_indices = set()
         matched_leaf_count = None
         matched_detail = None  # (leaf_index, leaf_count, k, n, timelock_kind, timelock_value)
 
-        for leaf_hash, branch_index, address_index in self.signing_leaf_records:
-            cache_key = (branch_index, address_index)
+        for leaf_hash, raw_branch_value, address_index in self.signing_leaf_records:
+            branch_position = PSBTParser._resolve_branch_position(registered_descriptor, raw_branch_value)
+            if branch_position is None:
+                # This record's raw branch value isn't one this
+                # descriptor's multipath list declares at all -- it can't
+                # correspond to this registered descriptor. Skip rather
+                # than guess a branch and risk matching (or, worse,
+                # silently failing to match) the wrong one.
+                continue
+
+            cache_key = (branch_position, address_index)
             if cache_key not in derived_leaves_cache:
                 try:
-                    derived = registered_descriptor.derive(address_index, branch_index=branch_index)
+                    derived = registered_descriptor.derive(address_index, branch_index=branch_position)
                     leaves_with_paths, _ = _tweak_helper(derived.taptree)
                 except Exception:
                     logger.info("Could not walk registered descriptor's tap tree", exc_info=True)
                     leaves_with_paths = []
-                derived_leaves_cache[cache_key] = leaves_with_paths
+                # leaf.serialize() (not a from-scratch
+                # bytes([version]) + miniscript.compile()) -- the real
+                # BIP341 TapLeaf preimage needs the script
+                # compact-size-length-prefixed, which TapLeaf.serialize()
+                # already does correctly.
+                derived_leaves_cache[cache_key] = [
+                    (leaf, hashes.tagged_hash("TapLeaf", leaf.serialize()))
+                    for leaf, _path in leaves_with_paths
+                ]
 
-            leaves_with_paths = derived_leaves_cache[cache_key]
-            if leaves_with_paths:
-                matched_leaf_count = len(leaves_with_paths)
+            leaves_with_hashes = derived_leaves_cache[cache_key]
+            if leaves_with_hashes:
+                matched_leaf_count = len(leaves_with_hashes)
 
-            for idx, (leaf, _path) in enumerate(leaves_with_paths):
-                # leaf.serialize() (not a from-scratch bytes([version]) +
-                # miniscript.compile()) -- the real BIP341 TapLeaf
-                # preimage needs the script compact-size-length-prefixed,
-                # which TapLeaf.serialize() already does correctly.
-                candidate_hash = hashes.tagged_hash("TapLeaf", leaf.serialize())
+            for idx, (leaf, candidate_hash) in enumerate(leaves_with_hashes):
                 if candidate_hash != leaf_hash:
                     continue
                 matched_leaf_indices.add(idx)
                 if matched_detail is None:
                     k, n, timelock_kind, timelock_value = PSBTParser._parse_leaf_quorum(leaf.miniscript)
-                    matched_detail = (idx + 1, len(leaves_with_paths), k, n, timelock_kind, timelock_value)
+                    matched_detail = (idx + 1, len(leaves_with_hashes), k, n, timelock_kind, timelock_value)
                 break
 
         if not matched_leaf_indices:
@@ -933,9 +1128,12 @@ class PSBTParser():
         one of "after_height" | "after_time" | "older_blocks" |
         "older_time", and timelock_value is already in the right unit
         (blocks, or seconds for the *_time kinds) -- no further
-        unit-guessing needed at render time.
+        unit-guessing needed at render time. Returns (None, None) if the
+        embit miniscript AST classes this needs weren't importable at
+        module load (see the module-level try/except above).
         """
-        from embit.descriptor.miniscript import After, Older
+        if After is None:
+            return (None, None)
 
         n = int(str(inner.args[0]))
         if isinstance(inner, After):
@@ -976,11 +1174,12 @@ class PSBTParser():
         all-None rather than guessing.
 
         Returns (k, n, timelock_kind, timelock_value), any of which may
-        be None.
+        be None. Returns all-None if the embit miniscript AST classes
+        this needs weren't importable at module load (see the
+        module-level try/except above).
         """
-        from embit.descriptor.miniscript import (
-            AndV, V, After, Older, MultiA, Multi, Sortedmulti, SortedmultiA, Pk,
-        )
+        if AndV is None:
+            return (None, None, None, None)
 
         def _unwrap_v(n):
             if isinstance(n, V) and len(n.args) == 1:

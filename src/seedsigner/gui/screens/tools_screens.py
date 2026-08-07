@@ -504,6 +504,12 @@ class ToolsAddressExplorerAddressTypeScreen(ButtonListScreen):
 class ToolsAddressExplorerAddressListScreen(ButtonListScreen):
     start_index: int = 0
     addresses: list[str] = None
+    # False for a fixed (non-wildcard) descriptor's single, immutable
+    # address -- there is no "next page" to show, and offering one leads
+    # the caller to re-enter this view with a start_index that has
+    # nothing behind it, relabeling the same address under a fabricated,
+    # ever-increasing index (see ToolsAddressExplorerAddressListView).
+    show_next_button: bool = True
 
     def __post_init__(self):
         self.button_font_name = GUIConstants.FIXED_WIDTH_EMPHASIS_FONT_NAME
@@ -535,9 +541,10 @@ class ToolsAddressExplorerAddressListScreen(ButtonListScreen):
             active_button_label = f"{cur_index}:{address}"
 
             self.button_data.append(ButtonOption(button_label, active_button_label=active_button_label))
-        
-        # TRANSLATOR_NOTE: Insert the number of addrs displayed per screen (e.g. "Next 10")
-        button_label = _("Next {}").format(len(self.addresses))
-        self.button_data.append(ButtonOption(button_label, right_icon_name=SeedSignerIconConstants.CHEVRON_RIGHT))
+
+        if self.show_next_button:
+            # TRANSLATOR_NOTE: Insert the number of addrs displayed per screen (e.g. "Next 10")
+            button_label = _("Next {}").format(len(self.addresses))
+            self.button_data.append(ButtonOption(button_label, right_icon_name=SeedSignerIconConstants.CHEVRON_RIGHT))
 
         super().__post_init__()

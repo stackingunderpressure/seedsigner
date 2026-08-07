@@ -114,13 +114,17 @@ class ScanView(View):
                 # pubkey with no further derivation possible (e.g.
                 # [fp/path/0/0]<64-hex-xonly>) -- appending /{0,1}/* to a
                 # key that can't be derived any further makes
-                # Descriptor.from_string raise. Taproot descriptors don't
-                # need this rewrite in the first place: a multi-leaf
-                # tree's leaves are matched directly against the PSBT's
-                # own leaf hashes (PSBTParser.get_signing_leaf_summary),
-                # not via Descriptor.owns()'s wildcard-branch machinery
-                # the way legacy multisig change verification is.
-                if not descriptor_str.lstrip().startswith("tr("):
+                # Descriptor.from_string raise. That bare-xonly shape is
+                # the ONLY thing this rewrite needs to avoid -- an
+                # ordinary xpub-based taproot descriptor
+                # (tr([fp/path]xpub.../0/*)) is exactly as derivable as a
+                # legacy multisig xpub and benefits from the same
+                # change-branch rewrite. Excluding every `tr(`-prefixed
+                # descriptor (an earlier version of this fix) went too
+                # far: it also silently broke change verification for
+                # that legitimate plain-wildcard taproot shape.
+                from seedsigner.helpers.embit_utils import is_bare_taproot_leaf_key_descriptor
+                if not is_bare_taproot_leaf_key_descriptor(descriptor_str):
                     try:
                         if len(re.findall (r'\[([0-9,a-f,A-F]+?)(\/[0-9,\/,h\']+?)\].*?(\/0\/\*)', descriptor_str)) > 0:
                             p = re.compile(r'(\[[0-9,a-f,A-F]+?\/[0-9,\/,h\']+?\].*?)(\/0\/\*)')

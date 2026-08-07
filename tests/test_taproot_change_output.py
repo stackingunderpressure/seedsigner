@@ -323,7 +323,75 @@ class TestVerifyMultisigOutputAgainstRegisteredTaprootDescriptor:
         parser = PSBTParser.__new__(PSBTParser)
         parser.change_data = [{"output_index": 0}]
         fake_output = type("FakeOutput", (), {"script_pubkey": branch1_script_pubkey})()
-        parser.psbt = type("FakePSBT", (), {"outputs": [fake_output]})()
+        # verify_multisig_output reads the REAL output script via
+        # self.psbt.tx.vout[i] (embit's own PSBT.tx is a derived property
+        # rebuilt from the same OutputScope.script_pubkey values, never
+        # an independent field -- see verify_multisig_output's docstring)
+        # rather than through the OutputScope directly, so this fake
+        # needs a matching `.tx.vout` alongside `.outputs`.
+        fake_vout = type("FakeVout", (), {"script_pubkey": branch1_script_pubkey})()
+        fake_tx = type("FakeTx", (), {"vout": [fake_vout]})()
+        parser.psbt = type("FakePSBT", (), {"outputs": [fake_output], "tx": fake_tx})()
+
+        assert parser.verify_multisig_output(descriptor, change_num=0) is True
+
+    def test_embit_owns_itself_still_has_the_bug_this_workaround_exists_for(self):
+        """Documents WHY verify_multisig_output needs its own workaround
+        for ANY fixed descriptor, not just taproot ones: embit's
+        AllowedDerivation.check_derivation() only sets its `idx` return
+        value inside a wildcard branch, so Descriptor.owns() never
+        reports a match at all for a fully fixed (non-wildcard) key --
+        script-type-agnostic, confirmed here directly against a plain
+        wsh(multi(...)) descriptor, not just taproot."""
+        embit_network = NETWORKS[SettingsConstants.map_network_to_embit(SettingsConstants.REGTEST)]
+        root_a = bip32.HDKey.from_seed(self.seed_a.seed_bytes, version=embit_network["xprv"])
+        fp_a = root_a.my_fingerprint
+        account_path = [0x80000000 + 48, 0x80000000 + 1, 0x80000000 + 0, 0x80000000 + 2]
+        account_xpub = root_a.derive(account_path).to_public()
+        descriptor = Descriptor.from_string(
+            f"wsh(multi(1,[{fp_a.hex()}/48h/1h/0h/2h]{account_xpub.to_base58()}/0/0))"
+        )
+        assert descriptor.is_wildcard is False
+
+        signing_derivation = account_path + [0, 0]
+        key_a_signing = root_a.derive(signing_derivation)
+        real_script_pubkey = descriptor.derive(0, branch_index=0).script_pubkey()
+
+        fake_scope = type("FakeScope", (), {
+            "script_pubkey": real_script_pubkey,
+            "bip32_derivations": {key_a_signing.to_public(): DerivationPath(fp_a, signing_derivation)},
+            "taproot_bip32_derivations": {},
+        })()
+        assert descriptor.owns(fake_scope) is False, "if this ever starts returning True, embit fixed the upstream bug and the workaround in verify_multisig_output can be simplified"
+
+    def test_verify_multisig_output_works_for_a_fixed_non_taproot_descriptor(self):
+        """The fix: gating the derive()-and-compare workaround on
+        `not descriptor.is_wildcard` (not `is_taproot and not
+        is_wildcard`) means a fixed legacy/segwit descriptor -- e.g. a
+        DynastyTrust-style [fp/path]xpub/0/0 shape for a non-taproot
+        wallet -- gets the same protection a fixed taproot descriptor
+        already had, instead of silently falling through to the broken
+        embit owns() call this test class's sibling test just proved
+        returns a false negative for this exact shape."""
+        embit_network = NETWORKS[SettingsConstants.map_network_to_embit(SettingsConstants.REGTEST)]
+        root_a = bip32.HDKey.from_seed(self.seed_a.seed_bytes, version=embit_network["xprv"])
+        fp_a = root_a.my_fingerprint
+        account_path = [0x80000000 + 48, 0x80000000 + 1, 0x80000000 + 0, 0x80000000 + 2]
+        account_xpub = root_a.derive(account_path).to_public()
+        descriptor = Descriptor.from_string(
+            f"wsh(multi(1,[{fp_a.hex()}/48h/1h/0h/2h]{account_xpub.to_base58()}/0/0))"
+        )
+        assert descriptor.is_wildcard is False
+        assert descriptor.is_taproot is False
+
+        real_script_pubkey = descriptor.derive(0, branch_index=0).script_pubkey()
+
+        parser = PSBTParser.__new__(PSBTParser)
+        parser.change_data = [{"output_index": 0}]
+        fake_output = type("FakeOutput", (), {"script_pubkey": real_script_pubkey})()
+        fake_vout = type("FakeVout", (), {"script_pubkey": real_script_pubkey})()
+        fake_tx = type("FakeTx", (), {"vout": [fake_vout]})()
+        parser.psbt = type("FakePSBT", (), {"outputs": [fake_output], "tx": fake_tx})()
 
         assert parser.verify_multisig_output(descriptor, change_num=0) is True
 

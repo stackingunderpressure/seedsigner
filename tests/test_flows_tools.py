@@ -215,6 +215,66 @@ class TestToolsFlows(FlowTest):
         ])
 
 
+    def test__address_explorer__scan_single_sig_descriptor__flow(self):
+        """
+            Address Explorer should be able to parse a plain single-sig native
+            segwit descriptor (e.g. exported from another coordinator's hot
+            wallet, whose seed isn't loaded on this device) and generate
+            addresses -- previously hit NotYetImplementedView.
+        """
+        def load_descriptor_into_decoder(view: scan_views.ScanView):
+            single_sig_descriptor = "wpkh([73c5da0a/84h/1h/0h]tpubDC5FSnBiZDMmhiuCmWAYsLwgLYrrT9rAqvTySfuCCrgsWz8wxMXUS9Tb9iVMvcRbvFcAHGkMD5Kx8koh4GquNGNTfohfk7pgjhaPCdXpoba/0/*)"
+            view.decoder.add_data(single_sig_descriptor)
+
+        self.run_sequence([
+            FlowStep(MainMenuView, button_data_selection=MainMenuView.TOOLS),
+            FlowStep(tools_views.ToolsMenuView, button_data_selection=tools_views.ToolsMenuView.ADDRESS_EXPLORER),
+            FlowStep(tools_views.ToolsAddressExplorerSelectSourceView, button_data_selection=tools_views.ToolsAddressExplorerSelectSourceView.SCAN_DESCRIPTOR),
+            FlowStep(scan_views.ScanWalletDescriptorView, before_run=load_descriptor_into_decoder),  # simulate read descriptor QR
+            FlowStep(seed_views.MultisigWalletDescriptorView, button_data_selection=seed_views.MultisigWalletDescriptorView.ADDRESS_EXPLORER),
+            FlowStep(tools_views.ToolsAddressExplorerAddressTypeView, button_data_selection=tools_views.ToolsAddressExplorerAddressTypeView.RECEIVE),
+            FlowStep(tools_views.ToolsAddressExplorerAddressListView, screen_return_value=10),  # ret NEXT page of addrs
+            FlowStep(tools_views.ToolsAddressExplorerAddressListView, screen_return_value=4),  # ret a specific addr from the list
+            FlowStep(tools_views.ToolsAddressExplorerAddressView),  # runs until dismissed; no ret value
+            FlowStep(tools_views.ToolsAddressExplorerAddressListView),
+        ])
+
+
+    def test__address_explorer__scan_taproot_multi_a_relative_timelock_descriptor__flow(self):
+        """
+            A real Nunchuk-style inheritance-plan taproot descriptor: a
+            multi_a() "now" leaf plus an and_v(v:multi_a(...), older(N))
+            leaf gated by a RELATIVE (CSV) timelock, with a real (non-NUMS)
+            internal key. Previously invisible at the QR-classification
+            step (detect_segment_type only matched the literal substring
+            "sortedmulti", and multi_a is a different miniscript fragment)
+            -- never even reached the taproot-miniscript support built
+            earlier this session.
+        """
+        def load_descriptor_into_decoder(view: scan_views.ScanView):
+            nunchuk_descriptor = (
+                "tr(xpub661MyMwAqRbcGcsuusXYzWiehTp32FNRHK3jfmGH7Bp1hodY7urbX3GWykM4tqoQ71rPNv9y5w11eSgFjxpC4QjUvA5zfUEB1c7c5oLnhDw/<0;1>/*,"
+                "{multi_a(2,[a8260677/87h/0h/0h]xpub6CVBUbA2QfgKzCZQJgdTMC9CkBqT5LD7CjXMSwN1ueWWcs8z8ucceYV4rhF9e62A3CFZAh4rAvoD29jvcbQs5V1SX1eqRhoKvbJc57QeVmZ/<0;1>/*,"
+                "[73be5f8d/87h/0h/0h]xpub6BmrGMdTR3Hcg1HAsEb1CVnoG5LNBf2JELzVepxRaW4eGiZfcKx4WAP325xekwvuH8GDqMjLAPP7GmTRCXUeBJwUV6LzT9jSgLAeri5wM6E/<0;1>/*),"
+                "and_v(v:multi_a(1,[a8260677/48h/0h/1h/2h]xpub6DuonnAizryvxT1WGUKJ9PBSuaRZKKTJa1t6LhtBmFA6U9xHTt3LoNNDo1a2TNwBByaH4dwXxVPJWDo9dLsFg8G43CJP9smnx7aCK2QJEf2/<0;1>/*,"
+                "[73be5f8d/48h/0h/1h/2h]xpub6E2JVNxNNYqznU7Z8h5N9C4GZZJbs4S5cCh6j4zQHoomzucbyCJrF6rV9PRvggLGZmSR7b1XPnAyvTxDgNpx23to4LHcLgzh9StwxtZsP45/<0;1>/*),older(4199366))})"
+            )
+            view.decoder.add_data(nunchuk_descriptor)
+
+        self.run_sequence([
+            FlowStep(MainMenuView, button_data_selection=MainMenuView.TOOLS),
+            FlowStep(tools_views.ToolsMenuView, button_data_selection=tools_views.ToolsMenuView.ADDRESS_EXPLORER),
+            FlowStep(tools_views.ToolsAddressExplorerSelectSourceView, button_data_selection=tools_views.ToolsAddressExplorerSelectSourceView.SCAN_DESCRIPTOR),
+            FlowStep(scan_views.ScanWalletDescriptorView, before_run=load_descriptor_into_decoder),  # simulate read descriptor QR
+            FlowStep(seed_views.MultisigWalletDescriptorView, button_data_selection=seed_views.MultisigWalletDescriptorView.ADDRESS_EXPLORER),
+            FlowStep(tools_views.ToolsAddressExplorerAddressTypeView, button_data_selection=tools_views.ToolsAddressExplorerAddressTypeView.RECEIVE),
+            FlowStep(tools_views.ToolsAddressExplorerAddressListView, screen_return_value=10),  # ret NEXT page of addrs
+            FlowStep(tools_views.ToolsAddressExplorerAddressListView, screen_return_value=4),  # ret a specific addr from the list
+            FlowStep(tools_views.ToolsAddressExplorerAddressView),  # runs until dismissed; no ret value
+            FlowStep(tools_views.ToolsAddressExplorerAddressListView),
+        ])
+
+
     def test__verify_address__legacy_multisig_p2sh__flow(self):
         """
             Address Explorer should be able to scan a legacy multisig p2sh address and

@@ -603,6 +603,11 @@ class ToolsAddressExplorerAddressTypeView(View):
             if descriptor.is_taproot:
                 from seedsigner.helpers.embit_utils import get_taproot_policy_summary
                 wallet_descriptor_display_name = get_taproot_policy_summary(descriptor)
+            elif len(descriptor.keys) == 1:
+                # Single-sig (legacy/nested/native segwit) -- get_multisig_policy
+                # only expresses an M-of-N threshold and intentionally raises for
+                # anything else, so this has to be checked first.
+                wallet_descriptor_display_name = _("Single-sig")
             else:
                 from seedsigner.helpers.embit_utils import get_multisig_policy
                 threshold, n = get_multisig_policy(descriptor)
@@ -692,14 +697,14 @@ class ToolsAddressExplorerAddressListView(View):
                 elif "wallet_descriptor" in data:
                     from embit.descriptor import Descriptor
                     descriptor: Descriptor = data["wallet_descriptor"]
-                    if descriptor.is_basic_multisig or embit_utils.is_taproot_miniscript_wallet(descriptor):
+                    if descriptor.is_basic_multisig or embit_utils.is_taproot_miniscript_wallet(descriptor) or embit_utils.is_single_sig_wallet(descriptor):
                         for i in range(self.start_index, self.start_index + addrs_per_screen):
                             address = embit_utils.get_multisig_address(descriptor=descriptor, index=i, is_change=self.is_change, embit_network=data["embit_network"])
                             addresses.append(address)
                             data[addr_storage_key].append(address)
 
                     else:
-                        raise Exception(_("Single sig descriptors not yet supported"))
+                        raise Exception(_("Unsupported descriptor type"))
             finally:
                 # Everything is set. Stop the loading screen
                 self.loading_screen.stop()

@@ -379,7 +379,28 @@ class DecodeQR:
             elif "multisig setup file" in s.lower():
                 return QRType.WALLET__CONFIGFILE
 
-            elif "sortedmulti" in s:
+            elif re.match(r'^(sh|wsh|pkh|wpkh|tr)\(', desc_str):
+                # Any standard output descriptor (BIP380/381): single-sig or
+                # multisig, legacy/segwit/taproot, sortedmulti()/multi()/
+                # multi_a(), or a full taproot miniscript tree with
+                # timelocked leaves. Every one of these top-level wrapper
+                # functions is the full set this codebase's embit-based
+                # address derivation (get_multisig_address) knows how to
+                # handle -- see is_single_sig_wallet/is_basic_multisig/
+                # is_taproot_miniscript_wallet.
+                #
+                # This used to only match the literal substring
+                # "sortedmulti", which silently misclassified as INVALID:
+                # every plain single-sig descriptor (wpkh()/pkh()/tr(key),
+                # e.g. a hot wallet's watch-only export from another
+                # coordinator), and any taproot descriptor using multi_a()
+                # -- BIP-Taproot's own native multisig fragment -- instead
+                # of sortedmulti(), which is exactly the shape a real
+                # inheritance-plan wallet export uses: e.g.
+                # tr(key,{multi_a(2,...),and_v(v:multi_a(1,...),older(N))}).
+                # The QR was never even recognized as a descriptor at all,
+                # so it never reached any of the taproot/single-sig support
+                # built downstream in scan_views.py/tools_views.py.
                 return QRType.WALLET__GENERIC
 
             # Seed

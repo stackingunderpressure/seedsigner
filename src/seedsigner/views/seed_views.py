@@ -2061,6 +2061,11 @@ class MultisigWalletDescriptorView(View):
         if descriptor.is_taproot:
             from seedsigner.helpers.embit_utils import get_taproot_policy_summary
             policy = get_taproot_policy_summary(descriptor)
+        elif len(descriptor.keys) == 1:
+            # Single-sig (legacy/nested/native segwit) -- get_multisig_policy
+            # only knows how to express an M-of-N threshold and intentionally
+            # raises for anything else, so this has to be checked first.
+            policy = _("Single-sig")
         else:
             from seedsigner.helpers.embit_utils import get_multisig_policy
             threshold, n = get_multisig_policy(descriptor)

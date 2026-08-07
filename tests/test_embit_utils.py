@@ -518,6 +518,74 @@ class TestTaprootDescriptorRegistration:
         )
         assert embit_utils.is_taproot_miniscript_wallet(basic_multisig) is False, "basic multisig has its own is_basic_multisig path, not this one"
 
+    def test_is_single_sig_wallet(self):
+        from embit.descriptor import Descriptor
+
+        native_segwit = Descriptor.from_string(
+            "wpkh([73c5da0a/84h/1h/0h]tpubDC5FSnBiZDMmhiuCmWAYsLwgLYrrT9rAqvTySfuCCrgsWz8wxMXUS9Tb9iVMvcRbvFcAHGkMD5Kx8koh4GquNGNTfohfk7pgjhaPCdXpoba/{0,1}/*)#2aj6cvca"
+        )
+        assert embit_utils.is_single_sig_wallet(native_segwit) is True
+
+        single_key_taproot = Descriptor.from_string(
+            "tr([73c5da0a/86h/1h/0h]tpubDC5FSnBiZDMmhiuCmWAYsLwgLYrrT9rAqvTySfuCCrgsWz8wxMXUS9Tb9iVMvcRbvFcAHGkMD5Kx8koh4GquNGNTfohfk7pgjhaPCdXpoba/0/0)"
+        )
+        assert embit_utils.is_single_sig_wallet(single_key_taproot) is True
+
+        multi_leaf = self._tr_multileaf_descriptor()
+        assert embit_utils.is_single_sig_wallet(multi_leaf) is False, "3 keys (NUMS + 2 signers), not single-sig"
+
+        basic_multisig = Descriptor.from_string(
+            "wsh(sortedmulti(2,[8d55ff0d/48h/1h/0h/2h]tpubDDxNVWk924RTUhdkVB2uLHw1hGMPNMGufpZefhkkswjbZppVZcuMdjYKQN4ewUog9vbL6RBLFPRWcgTGT7kYP79N6thyJ43ELUs4N2szXMg/{0,1}/*,[73c5da0a/48h/1h/0h/2h]tpubDFH9dgzveyD8zTbPUFuLrGmCydNvxehyNdUXKJAQN8x4aZ4j6UZqGfnqFrD4NqyaTVGKbvEW54tsvPTK2UoSbCC1PJY8iCNiwTL3RWZEheQ/{0,1}/*,[0be174ee/48h/1h/0h/2h]tpubDEsePyLPkbxbrDiZSTTWdsviiNtiQjrvvzZnkLtG72QYLBygEsXePRsTdXi8DeMA7taCuuvoEBjUAfFrsNZeQJqfvG9fFoujYWbFPYUn7ux/{0,1}/*))#zw6cnrlk"
+        )
+        assert embit_utils.is_single_sig_wallet(basic_multisig) is False
+
+    def test_get_multisig_address_single_sig_segwit_matches_independent_derivation(self):
+        """The gap this session actually fixed: a plain single-sig wpkh()
+        descriptor exported from another coordinator (e.g. Nunchuk) used to
+        hit get_multisig_address's final `raise` because neither is_segwit's
+        multisig-only guard nor the taproot branch applied to it -- except
+        is_segwit was never multisig-only to begin with; the real blocker
+        was entirely at the routing layer (scan_views.py / tools_views.py),
+        which is what the other assertions in this test file's flow-level
+        tests cover. This test cross-checks the actual math independently:
+        derive the expected pubkey/address straight from the xpub via
+        embit's own bip32/script primitives (a second, independent code
+        path from Descriptor.derive()) and confirm get_multisig_address
+        lands on exactly the same address for both receive and change,
+        at more than just index 0."""
+        from embit import bip32, script
+        from embit.descriptor import Descriptor
+        from embit.networks import NETWORKS
+
+        desc_str = "wpkh([73c5da0a/84h/1h/0h]tpubDC5FSnBiZDMmhiuCmWAYsLwgLYrrT9rAqvTySfuCCrgsWz8wxMXUS9Tb9iVMvcRbvFcAHGkMD5Kx8koh4GquNGNTfohfk7pgjhaPCdXpoba/{0,1}/*)#2aj6cvca"
+        descriptor = Descriptor.from_string(desc_str)
+        xpub = bip32.HDKey.from_base58("tpubDC5FSnBiZDMmhiuCmWAYsLwgLYrrT9rAqvTySfuCCrgsWz8wxMXUS9Tb9iVMvcRbvFcAHGkMD5Kx8koh4GquNGNTfohfk7pgjhaPCdXpoba")
+
+        for index, is_change in [(0, False), (5, False), (0, True), (12, True)]:
+            expected_pubkey = xpub.derive([1 if is_change else 0, index]).key
+            expected_address = script.p2wpkh(expected_pubkey).address(network=NETWORKS["test"])
+            actual_address = embit_utils.get_multisig_address(descriptor=descriptor, index=index, is_change=is_change, embit_network="test")
+            assert actual_address == expected_address
+            assert actual_address.startswith("tb1q")
+
+    def test_get_multisig_address_single_sig_legacy(self):
+        """Legacy single-sig (pkh) previously fell through get_multisig_address's
+        legacy branch entirely -- that branch required is_basic_multisig, which
+        a bare pkh() key never satisfies. Cross-checked against embit's own
+        p2pkh script/address primitives directly."""
+        from embit import bip32, script
+        from embit.descriptor import Descriptor
+        from embit.networks import NETWORKS
+
+        desc_str = "pkh([73c5da0a/44h/1h/0h]tpubDC5FSnBiZDMmhiuCmWAYsLwgLYrrT9rAqvTySfuCCrgsWz8wxMXUS9Tb9iVMvcRbvFcAHGkMD5Kx8koh4GquNGNTfohfk7pgjhaPCdXpoba/{0,1}/*)"
+        descriptor = Descriptor.from_string(desc_str)
+        xpub = bip32.HDKey.from_base58("tpubDC5FSnBiZDMmhiuCmWAYsLwgLYrrT9rAqvTySfuCCrgsWz8wxMXUS9Tb9iVMvcRbvFcAHGkMD5Kx8koh4GquNGNTfohfk7pgjhaPCdXpoba")
+
+        expected_pubkey = xpub.derive([0, 3]).key
+        expected_address = script.p2pkh(expected_pubkey).address(network=NETWORKS["test"])
+        actual_address = embit_utils.get_multisig_address(descriptor=descriptor, index=3, is_change=False, embit_network="test")
+        assert actual_address == expected_address
+
     def test_get_multisig_address_taproot_matches_independent_tap_tree_math(self):
         """The real regression this closes: get_multisig_address's taproot
         branch used to unconditionally raise. Cross-checks the address
@@ -594,6 +662,15 @@ class TestTaprootDescriptorRegistration:
             embit_utils.get_taproot_policy_summary(Descriptor.from_string(
                 "wpkh([73c5da0a/84h/1h/0h]tpubDC5FSnBiZDMmhiuCmWAYsLwgLYrrT9rAqvTySfuCCrgsWz8wxMXUS9Tb9iVMvcRbvFcAHGkMD5Kx8koh4GquNGNTfohfk7pgjhaPCdXpoba/{0,1}/*)#2aj6cvca"
             ))
+
+        # Single-key tr(key) has 0 leaves -- should read as "single-sig",
+        # not the technically-true-but-confusing "1 keys, 0 leaves".
+        single_key = Descriptor.from_string(
+            "tr([73c5da0a/86h/1h/0h]tpubDC5FSnBiZDMmhiuCmWAYsLwgLYrrT9rAqvTySfuCCrgsWz8wxMXUS9Tb9iVMvcRbvFcAHGkMD5Kx8koh4GquNGNTfohfk7pgjhaPCdXpoba/0/0)"
+        )
+        single_key_summary = embit_utils.get_taproot_policy_summary(single_key)
+        assert single_key_summary == "Taproot, single-sig"
+        assert "0 leaves" not in single_key_summary
 
     def test_get_taproot_policy_summary_counts_a_larger_tree_correctly(self):
         """A 3-leaf tree (uneven binary tree -- 1 leaf at depth 1, 2 at

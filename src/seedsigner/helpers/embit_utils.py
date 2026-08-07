@@ -93,8 +93,14 @@ def get_multisig_address(descriptor: Descriptor, index: int = 0, is_change: bool
     else:
         branch_index = 0
 
-    # Can derive p2wsh, p2sh-p2wsh, and legacy (non-segwit) p2sh
-    if descriptor.is_segwit or (descriptor.is_legacy and descriptor.is_basic_multisig):
+    # Can derive p2wpkh/p2wsh, p2sh-p2wpkh/p2sh-p2wsh, and legacy (non-segwit)
+    # p2pkh/p2sh alike -- descriptor.derive().script_pubkey() is generic over
+    # single-key vs multi-key policies, so a plain single-sig wpkh()/pkh()
+    # descriptor (e.g. a wallet export from another coordinator, not derived
+    # from a seed loaded on this device) is handled by the exact same call as
+    # multisig; only the legacy branch needs an explicit single-key allowance
+    # since is_basic_multisig alone would otherwise exclude bare pkh().
+    if descriptor.is_segwit or (descriptor.is_legacy and (descriptor.is_basic_multisig or len(descriptor.keys) == 1)):
         return descriptor.derive(index, branch_index=branch_index).script_pubkey().address(network=NETWORKS[embit_network])
 
     elif descriptor.is_taproot:
@@ -138,15 +144,40 @@ def is_taproot_miniscript_wallet(descriptor: Descriptor) -> bool:
 
 
 
+def is_single_sig_wallet(descriptor: Descriptor) -> bool:
+    """
+    True for any descriptor with exactly one key -- legacy p2pkh, nested or
+    native segwit, or single-key taproot (tr(key)). This is the counterpart
+    to is_taproot_miniscript_wallet/descriptor.is_basic_multisig: together
+    the three predicates cover every descriptor shape get_multisig_address
+    (despite its name -- it's generic) actually knows how to derive.
+
+    A watch-only descriptor exported from another coordinator (e.g. a hot
+    wallet's xpub from Nunchuk) for a wallet whose seed isn't loaded on this
+    device is exactly the case this exists for -- viewing or verifying its
+    addresses shouldn't require importing that wallet's private key material.
+    """
+    return len(descriptor.keys) == 1
+
+
+
 def _count_tap_leaves(tree) -> int:
     """
     Recursively counts the script leaves in an embit TapTree. BIP371's tree
     is a binary merkle tree -- an internal node's `.tree` is a 2-tuple of
     child TapTree nodes; a leaf's `.tree` is the leaf's own miniscript/script
-    object (not a tuple). `descriptor.taptree` is falsy for a single-key
-    tr(key) descriptor with no leaves at all.
+    object (not a tuple).
+
+    For a single-key tr(key) descriptor with no script tree at all,
+    `descriptor.taptree` is NOT None -- embit still returns a `TapTree()`
+    instance -- but that instance's own `.tree` attribute is None. Checking
+    only `tree is None` at the top missed this and fell through to the
+    `return 1` default, reporting a phantom leaf for a plain single-key
+    wallet. Both levels need the None check; a real leaf's `.tree` is always
+    its compiled policy object, never None, so this can't misfire on an
+    actual leaf.
     """
-    if tree is None:
+    if tree is None or tree.tree is None:
         return 0
     if isinstance(tree.tree, tuple):
         return sum(_count_tap_leaves(child) for child in tree.tree)
@@ -169,6 +200,11 @@ def get_taproot_policy_summary(descriptor: Descriptor) -> str:
     if not descriptor.is_taproot:
         raise ValueError(f"Expected a taproot descriptor, got: {descriptor.brief_policy}")
     num_leaves = _count_tap_leaves(descriptor.taptree)
+    if num_leaves == 0:
+        # Single-key tr(key) -- no script tree, just a key-path spend.
+        # "1 keys, 0 leaves" is technically accurate but reads like a
+        # malformed multisig rather than the single-sig wallet it is.
+        return _("Taproot, single-sig")
     return _("Taproot, {num_keys} keys, {num_leaves} leaves").format(
         num_keys=len(descriptor.keys),
         num_leaves=num_leaves,

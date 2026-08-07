@@ -122,10 +122,12 @@ class ScanView(View):
 
                 descriptor = Descriptor.from_string(descriptor_str)
 
-                from seedsigner.helpers.embit_utils import is_taproot_miniscript_wallet
-                if not descriptor.is_basic_multisig and not is_taproot_miniscript_wallet(descriptor):
-                    # TODO: Handle single-sig descriptors?
-                    logger.info(f"Received single sig descriptor: {descriptor}")
+                from seedsigner.helpers.embit_utils import is_taproot_miniscript_wallet, is_single_sig_wallet
+                if not descriptor.is_basic_multisig and not is_taproot_miniscript_wallet(descriptor) and not is_single_sig_wallet(descriptor):
+                    # A descriptor policy shape we don't know how to derive
+                    # addresses for (not basic multisig, not a taproot
+                    # multi-leaf wallet, not single-key).
+                    logger.info(f"Received unsupported descriptor policy: {descriptor}")
                     return Destination(NotYetImplementedView)
 
                 self.controller.multisig_wallet_descriptor = descriptor

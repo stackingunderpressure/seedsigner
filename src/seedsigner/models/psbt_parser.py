@@ -37,6 +37,11 @@ class PSBTParser():
         self.destination_amounts = []
         self.op_return_data: bytes = None
 
+        # Leaf hashes (BIP371 TapLeaf hashes) this seed is actually about
+        # to sign against, collected across every input -- populated by
+        # _parse_inputs. Empty for a key-path-only or non-taproot spend.
+        self.signing_leaf_hashes = set()
+
         self.root = None
 
         if self.seed is not None:
@@ -112,6 +117,20 @@ class PSBTParser():
             else:
                 if self.policy != inp_policy:
                     raise RuntimeError("Mixed inputs in the transaction")
+
+            # Which tapscript leaf(s) is this seed actually about to sign
+            # on this input, if any? Only counts a leaf when the claimed
+            # pubkey genuinely re-derives from OUR OWN seed at the stated
+            # path (never trust the PSBT's claimed key) -- same
+            # never-trust-the-claim pattern _parse_outputs already uses
+            # for change recognition.
+            for pub, (leaf_hashes, derivation) in inp.taproot_bip32_derivations.items():
+                if not leaf_hashes:
+                    continue  # key-path-only claim on this input, not a leaf
+                candidate = self.root.derive(derivation.derivation)
+                if candidate.to_public().xonly() != pub.xonly():
+                    continue
+                self.signing_leaf_hashes.update(leaf_hashes)
 
     def _parse_outputs(self):
         self.spend_amount = 0
@@ -654,3 +673,149 @@ class PSBTParser():
 
         for out in self.psbt.outputs:
             _fill_scope(out)
+
+
+    def get_signing_leaf_summary(self, registered_descriptor: Descriptor = None) -> dict:
+        """
+        Facts about which tapscript spending path this seed is about to
+        sign, if any -- returns None when there's nothing taproot-
+        script-path-specific to say (key-path-only or non-taproot spend).
+        Returns raw data, not a formatted string: this is a model, and
+        translation (gettext) belongs at the view layer, same convention
+        every other model in this file already follows.
+
+        Two honesty tiers, deliberately never blurred:
+          - With a REGISTERED descriptor (the wallet policy the user
+            confirmed out of band, before this PSBT existed -- see
+            verify_multisig_output), this matches the signing leaf
+            against the wallet's own real tap tree and reports its true
+            position (leaf_index/leaf_count) and, for the handful of
+            simple shapes a tr_multileaf-style policy actually produces
+            (a bare key threshold, optionally wrapped in an absolute/
+            relative timelock), its real quorum -- read straight from
+            the descriptor's own PARSED miniscript AST (embit's
+            Miniscript.from_string() output), never decompiled from raw
+            script bytes. An unrecognized shape leaves quorum_k/n and
+            the timelock fields as None rather than guessing.
+          - With no registered descriptor (or one that doesn't match
+            this PSBT's leaf at all), only what's independently provable
+            from the PSBT's own metadata is reported: that a leaf is
+            being signed, and how many of THIS seed's own keys are
+            eligible on it. leaf_index/leaf_count/quorum are always None
+            in this tier -- without the whole tree those can't be
+            proven, only guessed, and a wrong guess here is worse than
+            saying nothing.
+
+        Returns:
+            {
+                "num_eligible_keys": int,               # always present
+                "leaf_index": int | None,                # 1-based
+                "leaf_count": int | None,
+                "quorum_k": int | None,
+                "quorum_n": int | None,
+                "timelock_kind": "after" | "older" | None,
+                "timelock_value": int | None,
+            }
+        """
+        if not self.signing_leaf_hashes:
+            return None
+
+        summary = {
+            "num_eligible_keys": len(self.signing_leaf_hashes),
+            "leaf_index": None,
+            "leaf_count": None,
+            "quorum_k": None,
+            "quorum_n": None,
+            "timelock_kind": None,
+            "timelock_value": None,
+        }
+
+        if registered_descriptor is None or not registered_descriptor.is_taproot:
+            return summary
+
+        from embit.descriptor.taptree import _tweak_helper
+        try:
+            leaves_with_paths, _ = _tweak_helper(registered_descriptor.taptree)
+        except Exception:
+            logger.info("Could not walk registered descriptor's tap tree", exc_info=True)
+            return summary
+
+        for idx, (leaf, _path) in enumerate(leaves_with_paths):
+            # leaf.serialize() (not a from-scratch bytes([version]) +
+            # miniscript.compile()) -- the real BIP341 TapLeaf preimage
+            # needs the script compact-size-length-prefixed, which
+            # TapLeaf.serialize() already does correctly; reconstructing
+            # it by hand here previously dropped that prefix and made
+            # every leaf hash mismatch, silently: caught by the sanity
+            # check in this method's own tests.
+            leaf_hash = hashes.tagged_hash("TapLeaf", leaf.serialize())
+            if leaf_hash not in self.signing_leaf_hashes:
+                continue
+            summary["leaf_index"] = idx + 1
+            summary["leaf_count"] = len(leaves_with_paths)
+            k, n, timelock_kind, timelock_value = PSBTParser._parse_leaf_quorum(leaf.miniscript)
+            summary["quorum_k"] = k
+            summary["quorum_n"] = n
+            summary["timelock_kind"] = timelock_kind
+            summary["timelock_value"] = timelock_value
+            break
+        # No match found (e.g. a different wallet's descriptor is
+        # registered) -- summary stays at its "just a bare fact" defaults,
+        # same as the no-descriptor tier. Never claim a position that
+        # wasn't actually proven against this exact tree.
+
+        return summary
+
+
+    @staticmethod
+    def _parse_leaf_quorum(node) -> tuple:
+        """
+        Safely reads a tapscript leaf's signer quorum from its PARSED
+        miniscript AST (never a from-scratch decompile of raw script
+        bytes -- that's real correctness risk on signing firmware this
+        repo won't take). Only recognizes the small set of shapes a
+        tr_multileaf-style policy actually produces: a bare multi-key
+        threshold (multi_a/multi/sortedmulti/sortedmulti_a), a single key
+        (pk), either optionally wrapped in and_v(v:after(N), ...) or
+        and_v(v:older(N), ...) for a timelocked leaf. Anything else
+        returns all-None rather than guessing.
+
+        Returns (k, n, timelock_kind, timelock_value), any of which may
+        be None.
+        """
+        from embit.descriptor.miniscript import (
+            AndV, V, After, Older, MultiA, Multi, Sortedmulti, SortedmultiA, Pk,
+        )
+
+        timelock_kind = None
+        timelock_value = None
+
+        if isinstance(node, AndV) and len(node.args) == 2:
+            wrapped, requirement = node.args
+            if not (isinstance(wrapped, V) and len(wrapped.args) == 1):
+                return (None, None, None, None)
+            inner = wrapped.args[0]
+            if isinstance(inner, After):
+                timelock_kind = "after"
+            elif isinstance(inner, Older):
+                timelock_kind = "older"
+            else:
+                return (None, None, None, None)
+            try:
+                timelock_value = int(str(inner.args[0]))
+            except (ValueError, IndexError):
+                return (None, None, None, None)
+            node = requirement
+
+        if isinstance(node, (MultiA, Multi, Sortedmulti, SortedmultiA)):
+            try:
+                k = int(str(node.args[0]))
+            except (ValueError, IndexError):
+                return (None, None, None, None)
+            n = len(node.args) - 1
+            return (k, n, timelock_kind, timelock_value)
+
+        if isinstance(node, Pk):
+            return (1, 1, timelock_kind, timelock_value)
+
+        return (None, None, timelock_kind, timelock_value)

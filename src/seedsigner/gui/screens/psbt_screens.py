@@ -464,6 +464,91 @@ class PSBTOverviewScreen(ButtonListScreen):
 
 
 @dataclass
+class PSBTSpendPathScreen(ButtonListScreen):
+    """
+    Shown only for a taproot script-path (tapscript leaf) signature --
+    plain single-key and legacy multisig spends never reach this screen.
+    Every field is optional and simply omitted when unknown (see
+    PSBTParser.get_signing_leaf_summary's two honesty tiers: without a
+    registered wallet descriptor, only num_eligible_keys is ever known).
+    """
+    leaf_index: int = None
+    leaf_count: int = None
+    quorum_k: int = None
+    quorum_n: int = None
+    timelock_kind: str = None  # "after" | "older" | None
+    timelock_value: int = None
+    num_eligible_keys: int = 1
+
+    def __post_init__(self):
+        self.title = _("Spending Path")
+        self.is_bottom_list = True
+        self.button_data = [ButtonOption("Continue")]
+        super().__post_init__()
+
+        screen_y = self.top_nav.height + GUIConstants.COMPONENT_PADDING
+
+        if self.leaf_index is not None and self.leaf_count is not None:
+            # TRANSLATOR_NOTE: e.g. "Leaf 2 of 3" -- which branch of a multi-path taproot policy this signature uses
+            value_text = _("Leaf {index} of {count}").format(index=self.leaf_index, count=self.leaf_count)
+        else:
+            value_text = _("Tapscript leaf")
+        self.components.append(IconTextLine(
+            label_text=_("Spending Path"),
+            value_text=value_text,
+            font_size=20,
+            screen_y=screen_y,
+            is_text_centered=True,
+        ))
+        screen_y = self.components[-1].screen_y + self.components[-1].height + GUIConstants.COMPONENT_PADDING
+
+        if self.quorum_k is not None and self.quorum_n is not None:
+            # TRANSLATOR_NOTE: e.g. "2 of 3 keys" -- how many signatures this leaf requires
+            quorum_text = _("{k} of {n} keys").format(k=self.quorum_k, n=self.quorum_n)
+            self.components.append(IconTextLine(
+                label_text=_("Requires"),
+                value_text=quorum_text,
+                font_size=20,
+                screen_y=screen_y,
+                is_text_centered=True,
+            ))
+            screen_y = self.components[-1].screen_y + self.components[-1].height + GUIConstants.COMPONENT_PADDING
+
+        if self.timelock_kind == "after":
+            # TRANSLATOR_NOTE: e.g. "After block 840000" -- an absolute-height timelock (CLTV)
+            timelock_text = _("After block {n}").format(n=self.timelock_value)
+        elif self.timelock_kind == "older":
+            # TRANSLATOR_NOTE: e.g. "After 144 blocks of age" -- a relative-age timelock (CSV)
+            timelock_text = _("After {n} blocks of age").format(n=self.timelock_value)
+        else:
+            timelock_text = None
+        if timelock_text:
+            self.components.append(IconTextLine(
+                label_text=_("Timelock"),
+                value_text=timelock_text,
+                font_size=20,
+                screen_y=screen_y,
+                is_text_centered=True,
+            ))
+            screen_y = self.components[-1].screen_y + self.components[-1].height + GUIConstants.COMPONENT_PADDING
+
+        # TRANSLATOR_NOTE: How many of THIS device's own keys can sign this specific leaf
+        eligible_text = ngettext(
+            "{n} of your keys is eligible",
+            "{n} of your keys are eligible",
+            self.num_eligible_keys,
+        ).format(n=self.num_eligible_keys)
+        self.components.append(IconTextLine(
+            label_text=_("Your Keys"),
+            value_text=eligible_text,
+            font_size=20,
+            screen_y=screen_y,
+            is_text_centered=True,
+        ))
+
+
+
+@dataclass
 class PSBTMathScreen(ButtonListScreen):
     input_amount: int = 0
     num_inputs: int = 0

@@ -151,16 +151,68 @@ class PSBTOverviewView(View):
             self.controller.psbt_seed = None
             return Destination(BackStackView)
 
+        # A taproot script-path (tapscript leaf) signature gets one extra
+        # stop before the usual math/change flow: which leaf is this,
+        # and (if a wallet descriptor is registered) what does it
+        # actually require. Plain single-key and legacy multisig spends
+        # have nothing to show here (get_signing_leaf_summary returns
+        # None) and go straight through, unaffected.
+        if psbt_parser.get_signing_leaf_summary(self.controller.multisig_wallet_descriptor):
+            return Destination(PSBTSpendPathView)
+
+        return PSBTOverviewView._next_destination(psbt_parser)
+
+
+    @staticmethod
+    def _next_destination(psbt_parser: PSBTParser) -> Destination:
         # expecting p2sh (legacy multisig) and p2pkh to have no policy set
         # skip change warning and psbt math view
         if psbt_parser.policy == None:
             return Destination(PSBTUnsupportedScriptTypeWarningView)
-        
+
         elif psbt_parser.change_amount == 0:
             return Destination(PSBTNoChangeWarningView)
 
         else:
             return Destination(PSBTMathView)
+
+
+
+class PSBTSpendPathView(View):
+    """
+    Shown only for a taproot script-path signature (see
+    PSBTOverviewView._next_destination and get_signing_leaf_summary) --
+    everything else routes straight past this view entirely.
+    """
+    def run(self):
+        from seedsigner.gui.screens.psbt_screens import PSBTSpendPathScreen
+        psbt_parser: PSBTParser = self.controller.psbt_parser
+
+        if not psbt_parser:
+            return Destination(MainMenuView)
+
+        summary = psbt_parser.get_signing_leaf_summary(self.controller.multisig_wallet_descriptor)
+        if not summary:
+            # Nothing to show after all (e.g. reached via BackStack
+            # after the registered descriptor changed) -- skip straight
+            # through rather than showing an empty screen.
+            return PSBTOverviewView._next_destination(psbt_parser)
+
+        selected_menu_num = self.run_screen(
+            PSBTSpendPathScreen,
+            leaf_index=summary["leaf_index"],
+            leaf_count=summary["leaf_count"],
+            quorum_k=summary["quorum_k"],
+            quorum_n=summary["quorum_n"],
+            timelock_kind=summary["timelock_kind"],
+            timelock_value=summary["timelock_value"],
+            num_eligible_keys=summary["num_eligible_keys"],
+        )
+
+        if selected_menu_num == RET_CODE__BACK_BUTTON:
+            return Destination(BackStackView)
+
+        return PSBTOverviewView._next_destination(psbt_parser)
 
 
 

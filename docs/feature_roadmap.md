@@ -55,16 +55,31 @@ These features will not be included in the initial v0.5.0 release and will have 
 * Multisig wallet descriptor QR scan(?) and address verification(?)
 * Sign taproot transactions
 * Non-taproot native segwit (wsh) miniscript wallets with OR/AND/timelock
-  policy combinators (e.g. Nunchuk's "Miniscript" wallet type: 2-of-3
-  multisig OR a single timelocked key) -- currently rejected at the
-  descriptor-shape gate in scan_views.py regardless of import method
-  (BSMS, Coldcard export, raw descriptor), since it's neither basic
-  multisig, taproot, nor single-sig. A real, separate body of work from
-  the tr_multileaf taproot support: parsing embit's non-taproot
-  miniscript AST for arbitrary combinator trees, deriving wsh()
-  addresses for it, and showing the OR/AND policy tree on the
-  registration/signing screens the way the taproot leaf disclosure does
-  today. (Surfaced 2026-08-07 testing a real "GiftLockerTest" wallet.)
+  policy combinators -- currently rejected at the descriptor-shape gate
+  in scan_views.py regardless of import method (BSMS, Coldcard export,
+  raw descriptor), since it's neither basic multisig, taproot, nor
+  single-sig. A real, separate body of work from the tr_multileaf
+  taproot support: parsing embit's non-taproot miniscript AST for
+  arbitrary combinator trees, deriving wsh() addresses for it, and
+  showing the OR/AND policy tree on the registration/signing screens the
+  way the taproot leaf disclosure does today. (Surfaced 2026-08-07
+  testing a Nunchuk-built wsh() test wallet, "GiftLockerTest" -- see
+  below; that specific idea is NOT going this route, noted here only
+  because the gap itself is real and could resurface with a different
+  wallet.)
+* "Gift Locker" (originated 2023, predates DynastyTrust): lock UTXOs
+  under a timelock with a key-recovery service -- structurally this is
+  DynastyTrust's own founders-now / timelocked-recovery leaf pattern
+  under different framing, not a distinct wsh() miniscript engine.
+  Decided 2026-08-07: build it as another DynastyTrust vault TEMPLATE
+  on the existing tr_multileaf taproot compiler (see
+  dynastytrust/apps/web/src/lib/vault-templates.ts), not as a separate
+  wallet type -- meaning it needs NO new SeedSigner work at all once
+  built; every taproot leaf/quorum/timelock disclosure fixed this
+  session already covers it. Original board notes: education, spending
+  vs. storing key split, FOSS, steel-QR engraving for backup. Tracked
+  for real in the DynastyTrust repo, not here -- this line is a pointer
+  only.
 * Multi-language support (Transifex free for open source projects)
 * Multisig: sign PSBT with multiple keys at once
 * Custom OS, possibly with swappable SD card PSBT and multisig wallet descriptor storage

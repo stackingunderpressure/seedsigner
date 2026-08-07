@@ -54,6 +54,17 @@ These features will not be included in the initial v0.5.0 release and will have 
 
 * Multisig wallet descriptor QR scan(?) and address verification(?)
 * Sign taproot transactions
+* Non-taproot native segwit (wsh) miniscript wallets with OR/AND/timelock
+  policy combinators (e.g. Nunchuk's "Miniscript" wallet type: 2-of-3
+  multisig OR a single timelocked key) -- currently rejected at the
+  descriptor-shape gate in scan_views.py regardless of import method
+  (BSMS, Coldcard export, raw descriptor), since it's neither basic
+  multisig, taproot, nor single-sig. A real, separate body of work from
+  the tr_multileaf taproot support: parsing embit's non-taproot
+  miniscript AST for arbitrary combinator trees, deriving wsh()
+  addresses for it, and showing the OR/AND policy tree on the
+  registration/signing screens the way the taproot leaf disclosure does
+  today. (Surfaced 2026-08-07 testing a real "GiftLockerTest" wallet.)
 * Multi-language support (Transifex free for open source projects)
 * Multisig: sign PSBT with multiple keys at once
 * Custom OS, possibly with swappable SD card PSBT and multisig wallet descriptor storage

@@ -28,6 +28,7 @@ class QRType:
     WALLET__UR = "wallet__ur"
     WALLET__CONFIGFILE = "wallet__configfile"
     WALLET__GENERIC = "wallet__generic"
+    WALLET__BBQR = "wallet__bbqr"
     OUTPUT__UR = "output__ur"
     ACCOUNT__UR = "account__ur"
     BYTES__UR = "bytes__ur"

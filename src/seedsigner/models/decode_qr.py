@@ -79,6 +79,9 @@ class DecodeQR:
             elif self.qr_type == QRType.PSBT__BBQR:
                 self.decoder = BBQRPsbtQrDecoder() # BBQr Decoder
 
+            elif self.qr_type == QRType.WALLET__BBQR:
+                self.decoder = BBQRWalletDescriptorQrDecoder() # BBQr Decoder, 'U' (Unicode text) file type -- e.g. Coldcard's "Export wallet" BBQr option
+
             elif self.qr_type in [QRType.SEED__SEEDQR, QRType.SEED__COMPACTSEEDQR, QRType.SEED__MNEMONIC, QRType.SEED__FOUR_LETTER_MNEMONIC, QRType.SEED__UR2]:
                 self.decoder = SeedQrDecoder(wordlist_language_code=self.wordlist_language_code)          
 
@@ -234,7 +237,7 @@ class DecodeQR:
         if self.qr_type in [QRType.PSBT__UR2, QRType.OUTPUT__UR, QRType.ACCOUNT__UR, QRType.BYTES__UR]:
             return int(self.decoder.estimated_percent_complete(weight_mixed_frames=weight_mixed_frames) * 100)
 
-        elif self.qr_type in [QRType.PSBT__SPECTER, QRType.PSBT__BBQR]:
+        elif self.qr_type in [QRType.PSBT__SPECTER, QRType.PSBT__BBQR, QRType.WALLET__BBQR]:
             if self.decoder.total_segments == None:
                 return 0
             return int((self.decoder.collected_segments / self.decoder.total_segments) * 100)
@@ -305,7 +308,7 @@ class DecodeQR:
         # every UR:CRYPTO-ACCOUNT QR was silently never recognized as a
         # wallet descriptor at all, regardless of what it actually
         # contained.
-        check = self.qr_type in [QRType.WALLET__SPECTER, QRType.WALLET__UR, QRType.WALLET__CONFIGFILE, QRType.WALLET__GENERIC, QRType.OUTPUT__UR, QRType.ACCOUNT__UR]
+        check = self.qr_type in [QRType.WALLET__SPECTER, QRType.WALLET__UR, QRType.WALLET__CONFIGFILE, QRType.WALLET__GENERIC, QRType.WALLET__BBQR, QRType.OUTPUT__UR, QRType.ACCOUNT__UR]
 
         if self.qr_type in [QRType.BYTES__UR]:
             cbor = self.decoder.result_message().cbor
@@ -371,6 +374,20 @@ class DecodeQR:
 
             elif re.search(r"^B\$[2HZ]P[0-9A-Z]{4}", s): # https://github.com/coinkite/BBQr/blob/master/BBQr.md#spliting-the-data
                 return QRType.PSBT__BBQR
+
+            elif re.search(r"^B\$[2HZ]U[0-9A-Z]{4}", s):
+                # Same BBQr container format, 'U' (Unicode Text) file
+                # type instead of 'P' (PSBT) -- what Coldcard's own
+                # "Export wallet" BBQr option uses for a wallet output
+                # descriptor (including a taproot miniscript one). Only
+                # the PSBT file type was ever recognized here; a BBQr
+                # wallet descriptor export decoded to valid BBQr framing
+                # and was then simply never classified as anything at
+                # all -- "unsupported" not because the descriptor itself
+                # was unsupported, but because this QR container format
+                # was only ever wired up for one of BBQr's several file
+                # types.
+                return QRType.WALLET__BBQR
 
             # Wallet Descriptor
             # str.split() with no args splits on ANY whitespace run (space,
@@ -804,6 +821,37 @@ class BBQRPsbtQrDecoder(BaseAnimatedQrDecoder):
         data = segment[8:]
 
         return data.strip()
+
+
+
+class BBQRWalletDescriptorQrDecoder(BBQRPsbtQrDecoder):
+    """
+        Decodes a BBQr (https://github.com/coinkite/BBQr) QR whose file
+        type is 'U' (Unicode Text) rather than 'P' (PSBT) -- e.g.
+        Coldcard's "Export wallet" BBQr option for a wallet output
+        descriptor, including a taproot miniscript one. BBQr's own
+        segment-reassembly and encoding-decode machinery (current_segment_num
+        /total_segment_nums/parse_segment/get_data, all inherited from
+        BBQRPsbtQrDecoder unchanged) never actually assumed the
+        reassembled bytes were a PSBT -- only this final interpretation
+        step differs: UTF-8 text, validated as a real descriptor via
+        embit, the same way GenericWalletQrDecoder validates a plain-text
+        descriptor QR.
+    """
+    def get_wallet_descriptor(self):
+        from embit.descriptor import Descriptor
+        data = self.get_data()
+        if data is None:
+            return None
+        try:
+            # Same whitespace-stripping GenericWalletQrDecoder and
+            # detect_segment_type's classification step both use.
+            descriptor_str = "".join(data.decode("utf-8").split())
+            Descriptor.from_string(descriptor_str)
+            return descriptor_str
+        except Exception as e:
+            logger.info(repr(e), exc_info=True)
+            return None
 
 
 

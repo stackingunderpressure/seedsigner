@@ -1,4 +1,4 @@
-from seedsigner.models.decode_qr import DecodeQR
+from seedsigner.models.decode_qr import DecodeQR, DecodeQRStatus
 from seedsigner.models.qr_type import QRType
 from seedsigner.models.settings import SettingsConstants
 
@@ -108,3 +108,101 @@ class TestIsWalletDescriptorProperty:
     def test_unrelated_types_are_still_not_wallet_descriptors(self):
         decoder = self._decode_qr_with_type(QRType.PSBT__UR2)
         assert decoder.is_wallet_descriptor is False
+
+
+def _bbqr_segments(payload: str, file_type: str, max_chars_per_segment: int = None) -> list:
+    """
+    Builds real BBQr-framed segments (https://github.com/coinkite/BBQr)
+    for a test payload: 'H' (hex) encoding, so the round-trip doesn't
+    depend on matching Coldcard's exact zlib window bits. Header layout
+    is B$ + encoding(1) + file_type(1) + total_segments(2, base36) +
+    part_idx(2, base36) + payload, matching BBQRPsbtQrDecoder's own
+    current_segment_num/total_segment_nums/parse_segment parsing.
+    """
+    hex_payload = payload.encode("utf-8").hex()
+    if max_chars_per_segment is None:
+        chunks = [hex_payload]
+    else:
+        chunks = [hex_payload[i:i + max_chars_per_segment] for i in range(0, len(hex_payload), max_chars_per_segment)]
+    total = len(chunks)
+
+    # base36 (not hex), per current_segment_num/total_segment_nums (int(..., 36))
+    import string
+    def _b36(n):
+        digits = string.digits + string.ascii_uppercase
+        return digits[n // 36] + digits[n % 36]
+
+    segments = []
+    for idx, chunk in enumerate(chunks):
+        header = "B$" + "H" + file_type + _b36(total) + _b36(idx)
+        segments.append(header + chunk)
+    return segments
+
+
+class TestBBQrWalletDescriptorDecoding:
+    """
+    Round-2 follow-up finding: BBQr support in this codebase was PSBT-only
+    end to end -- detect_segment_type's regex only ever matched BBQr's 'P'
+    (PSBT) file type, so a BBQr wallet descriptor export (Coldcard's own
+    "Export wallet" BBQr option uses 'U', Unicode Text) decoded to valid
+    BBQr framing and was then never classified as anything at all, even
+    though BBQRPsbtQrDecoder's actual segment-reassembly machinery never
+    assumed the payload was a PSBT in the first place -- only the file-type
+    classification and the final bytes-to-descriptor interpretation were
+    missing. Confirmed against a real Coldcard BBQr export screenshot: its
+    QR decoded to B$ZU0E06... -- 'Z' encoding, 'U' file type -- which used
+    to fall through detect_segment_type with no matching branch at all.
+    """
+
+    def test_single_part_bbqr_wallet_descriptor_is_recognized_and_decoded(self):
+        descriptor = "wpkh([73c5da0a/84h/1h/0h]tpubDC5FSnBiZDMmhiuCmWAYsLwgLYrrT9rAqvTySfuCCrgsWz8wxMXUS9Tb9iVMvcRbvFcAHGkMD5Kx8koh4GquNGNTfohfk7pgjhaPCdXpoba/0/*)"
+        segments = _bbqr_segments(descriptor, "U")
+        assert len(segments) == 1
+
+        assert _detect(segments[0]) == QRType.WALLET__BBQR
+
+        decoder = DecodeQR()
+        status = decoder.add_data(segments[0])
+        assert status == DecodeQRStatus.COMPLETE
+        assert decoder.is_complete is True
+        assert decoder.is_wallet_descriptor is True
+        assert decoder.get_wallet_descriptor() == descriptor
+
+    def test_multi_part_bbqr_wallet_descriptor_reassembles_correctly(self):
+        """The real Nunchuk-style taproot inheritance-plan descriptor is
+        long enough that a real device would split it across several BBQr
+        frames -- prove reassembly actually works, not just the
+        single-frame case."""
+        descriptor = (
+            "tr(xpub661MyMwAqRbcGcsuusXYzWiehTp32FNRHK3jfmGH7Bp1hodY7urbX3GWykM4tqoQ71rPNv9y5w11eSgFjxpC4QjUvA5zfUEB1c7c5oLnhDw/<0;1>/*,"
+            "{multi_a(2,[a8260677/87h/0h/0h]xpub6CVBUbA2QfgKzCZQJgdTMC9CkBqT5LD7CjXMSwN1ueWWcs8z8ucceYV4rhF9e62A3CFZAh4rAvoD29jvcbQs5V1SX1eqRhoKvbJc57QeVmZ/<0;1>/*,"
+            "[73be5f8d/87h/0h/0h]xpub6BmrGMdTR3Hcg1HAsEb1CVnoG5LNBf2JELzVepxRaW4eGiZfcKx4WAP325xekwvuH8GDqMjLAPP7GmTRCXUeBJwUV6LzT9jSgLAeri5wM6E/<0;1>/*),"
+            "and_v(v:multi_a(1,[a8260677/48h/0h/1h/2h]xpub6DuonnAizryvxT1WGUKJ9PBSuaRZKKTJa1t6LhtBmFA6U9xHTt3LoNNDo1a2TNwBByaH4dwXxVPJWDo9dLsFg8G43CJP9smnx7aCK2QJEf2/<0;1>/*,"
+            "[73be5f8d/48h/0h/1h/2h]xpub6E2JVNxNNYqznU7Z8h5N9C4GZZJbs4S5cCh6j4zQHoomzucbyCJrF6rV9PRvggLGZmSR7b1XPnAyvTxDgNpx23to4LHcLgzh9StwxtZsP45/<0;1>/*),older(4199366))})"
+        )
+        segments = _bbqr_segments(descriptor, "U", max_chars_per_segment=200)
+        assert len(segments) > 1, "sanity: this descriptor is long enough to actually exercise reassembly"
+
+        decoder = DecodeQR()
+        last_status = None
+        for i, segment in enumerate(segments):
+            last_status = decoder.add_data(segment)
+            if i < len(segments) - 1:
+                assert last_status in (DecodeQRStatus.PART_COMPLETE, DecodeQRStatus.PART_EXISTING)
+                assert decoder.get_percent_complete() == int(((i + 1) / len(segments)) * 100)
+
+        assert last_status == DecodeQRStatus.COMPLETE
+        assert decoder.is_wallet_descriptor is True
+        assert decoder.get_wallet_descriptor() == descriptor
+
+    def test_bbqr_psbt_file_type_is_unaffected(self):
+        # Regression guard: the new 'U' branch must be additive, not a
+        # replacement that breaks the existing 'P' (PSBT) BBQr path.
+        assert _detect("B$ZP0100somepayload") == QRType.PSBT__BBQR
+
+    def test_bbqr_wallet_descriptor_with_invalid_payload_does_not_crash(self):
+        segments = _bbqr_segments("not a real descriptor at all", "U")
+        decoder = DecodeQR()
+        status = decoder.add_data(segments[0])
+        assert status == DecodeQRStatus.COMPLETE  # BBQr framing itself is valid
+        assert decoder.get_wallet_descriptor() is None  # but the payload doesn't parse as a descriptor

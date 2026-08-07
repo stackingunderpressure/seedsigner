@@ -323,10 +323,11 @@ class PSBTChangeDetailsView(View):
         """
             change_data:
             {
-                'address': 'bc1q............', 
-                'amount': 397621401, 
-                'fingerprint': ['22bde1a9', '73c5da0a'], 
-                'derivation_path': ['m/48h/1h/0h/2h/1/0', 'm/48h/1h/0h/2h/1/0']
+                'address': 'bc1q............',
+                'amount': 397621401,
+                'fingerprint': ['22bde1a9', '73c5da0a'],
+                'derivation_path': ['m/48h/1h/0h/2h/1/0', 'm/48h/1h/0h/2h/1/0'],
+                'is_taproot_script_path': False
             }
         """
 
@@ -354,15 +355,28 @@ class PSBTChangeDetailsView(View):
         # if psbt_parser.num_change_outputs > 1:
         #     title += f" (#{self.change_address_num + 1})"
 
+        # A taproot multi-leaf output (change_data's is_taproot_script_path,
+        # set in psbt_parser._parse_outputs) needs the same registered-
+        # descriptor verification as legacy multisig, and for the same
+        # reason: is_multisig only recognizes OP_CHECKMULTISIG-style
+        # scripts, so a tr_multileaf vault's change would otherwise fall
+        # into the "single sig" branch below, which can only ever derive
+        # ONE key and test it against a plain p2tr(key) script -- it can
+        # never match a real multi-leaf output's internal-key+tap-tree
+        # tweaked script, so a genuinely valid change output would show as
+        # verification-failed even though _parse_outputs already
+        # cryptographically confirmed it moments earlier.
+        requires_registered_descriptor = psbt_parser.is_multisig or change_data.get("is_taproot_script_path", False)
+
         is_change_addr_verified = False
-        if psbt_parser.is_multisig:
-            # if the known-good multisig descriptor is already onboard:
+        if requires_registered_descriptor:
+            # if the known-good wallet descriptor is already onboard:
             if self.controller.multisig_wallet_descriptor:
                 is_change_addr_verified = psbt_parser.verify_multisig_output(self.controller.multisig_wallet_descriptor, change_num=self.change_address_num)
                 button_data = [self.NEXT]
 
             else:
-                # Have the Screen offer to load in the multisig descriptor.            
+                # Have the Screen offer to load in the wallet descriptor.
                 button_data = [self.VERIFY_MULTISIG, self.SKIP_VERIFICATION]
 
         else:
@@ -414,8 +428,8 @@ class PSBTChangeDetailsView(View):
             finally:
                 loading_screen.stop()
 
-        if is_change_addr_verified == False and (not psbt_parser.is_multisig or self.controller.multisig_wallet_descriptor is not None):
-            return Destination(PSBTAddressVerificationFailedView, view_args=dict(is_change=is_change_derivation_path, is_multisig=psbt_parser.is_multisig), clear_history=True)
+        if is_change_addr_verified == False and (not requires_registered_descriptor or self.controller.multisig_wallet_descriptor is not None):
+            return Destination(PSBTAddressVerificationFailedView, view_args=dict(is_change=is_change_derivation_path, is_multisig=requires_registered_descriptor), clear_history=True)
 
         selected_menu_num = self.run_screen(
             PSBTChangeDetailsScreen,
@@ -423,7 +437,7 @@ class PSBTChangeDetailsView(View):
             button_data=button_data,
             address=change_data.get("address"),
             amount=change_data.get("amount"),
-            is_multisig=psbt_parser.is_multisig,
+            is_multisig=requires_registered_descriptor,
             fingerprint=seed_fingerprint,
             derivation_path=derivation_path,
             is_change_derivation_path=is_change_derivation_path,

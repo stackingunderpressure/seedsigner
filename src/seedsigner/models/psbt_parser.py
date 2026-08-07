@@ -247,10 +247,28 @@ class PSBTParser():
                         derivation_paths.append(bip32.path_to_str(derivation_path.derivation))
 
                 # extract info from taproot outputs
+                is_taproot_script_path = False
                 if len(self.psbt.outputs[i].taproot_bip32_derivations) > 0:
                     for d, (leaf_hashes, derivation) in self.psbt.outputs[i].taproot_bip32_derivations.items():
                         fingerprints.append(hexlify(derivation.fingerprint).decode())
                         derivation_paths.append(bip32.path_to_str(derivation.derivation))
+                        # A non-empty leaf-hash list means this key belongs
+                        # to a specific tapscript leaf (a multi-leaf policy
+                        # like a tr_multileaf vault) rather than a plain
+                        # key-path-only taproot output. That distinction
+                        # matters downstream (PSBTChangeDetailsView): a
+                        # multi-leaf output can only be verified against a
+                        # REGISTERED wallet descriptor, the same as legacy
+                        # multisig -- recomputing a single derived key's
+                        # p2tr() address (the existing single-sig fallback)
+                        # can never match a multi-leaf output's real
+                        # (internal-key + tap-tree) tweaked script, so
+                        # without this flag a genuinely valid multi-leaf
+                        # change output gets waved through as "verification
+                        # failed" even though _parse_outputs above already
+                        # cryptographically confirmed it's real change.
+                        if len(leaf_hashes) > 0:
+                            is_taproot_script_path = True
 
                 self.change_data.append({
                     "output_index": i,
@@ -258,6 +276,7 @@ class PSBTParser():
                     "amount": self.psbt.tx.vout[i].value,
                     "fingerprint": fingerprints,
                     "derivation_path": derivation_paths,
+                    "is_taproot_script_path": is_taproot_script_path,
                 })
                 self.change_amount += self.psbt.tx.vout[i].value
 

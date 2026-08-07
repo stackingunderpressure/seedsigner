@@ -300,3 +300,79 @@ class TestVerifyMultisigOutputAgainstRegisteredTaprootDescriptor:
 
         parser = PSBTParser(psbt, self.seed_a, network=SettingsConstants.REGTEST)
         assert parser.verify_multisig_output(wrong_descriptor, change_num=0) is False
+
+
+
+class TestTaprootScriptPathChangeFlagsForRegisteredDescriptorVerification:
+    """
+    2026-08-07: found while wiring up the confirm-screen UX for registered
+    taproot descriptors. PSBTChangeDetailsView decides how to verify a
+    change output using ONLY psbt_parser.is_multisig, which checks for an
+    OP_CHECKMULTISIG-style script -- never true for taproot. Without a
+    second signal, a genuine tr_multileaf change output (recognized as
+    real change by _parse_outputs's tap-tree verification, tested above)
+    fell into the "single sig" verification branch, which can only ever
+    derive ONE key and test it against a bare p2tr(key) script. That can
+    never match a multi-leaf output's real internal-key+tap-tree tweaked
+    script, so the view would show "verification failed" for change that
+    was already proven genuine moments earlier -- exactly the kind of
+    false alarm that trains a user to stop trusting real warnings.
+
+    change_data["is_taproot_script_path"] is the fix: True whenever the
+    output's claimed signer key carries a non-empty taproot leaf-hash list
+    (BIP371 PSBT_OUT_TAP_BIP32_DERIVATION's leaf-hash array), which only
+    happens for a key tied to a specific tapscript leaf, never for a plain
+    key-path-only taproot output. These tests prove the flag is set
+    correctly for both shapes, since getting this backwards in either
+    direction is its own real failure mode (False for a real multi-leaf
+    output reintroduces the false-alarm bug; True for an ordinary
+    single-key output would wrongly route it through multisig-style
+    verification and demand a registered descriptor for a wallet that
+    never needed one).
+    """
+
+    seed_a = PSBTTestData.seed
+    seed_b = PSBTTestData.multisig_key_2
+
+    def test_multileaf_change_is_flagged_as_taproot_script_path(self):
+        psbt, *_ = _build_psbt_with_multileaf_change(self.seed_a, self.seed_b)
+        parser = PSBTParser(psbt, self.seed_a, network=SettingsConstants.REGTEST)
+        change_data = parser.get_change_data(0)
+        assert change_data["is_taproot_script_path"] is True
+
+        # The exact bug this closes: the old single-signal check would
+        # have sent this output down the wrong verification branch.
+        assert parser.is_multisig is False, "is_multisig itself correctly stays False for taproot -- that's not the bug, using it ALONE was"
+
+    def test_single_key_taproot_change_is_not_flagged_as_script_path(self):
+        """A plain key-path-only taproot change output (no tap tree at
+        all) must NOT be flagged -- it's correctly handled by the existing
+        single-sig verification branch, and mis-flagging it would demand a
+        registered descriptor for a wallet that was never multi-key."""
+        embit_network = NETWORKS[SettingsConstants.map_network_to_embit(SettingsConstants.REGTEST)]
+        root_a = bip32.HDKey.from_seed(self.seed_a.seed_bytes, version=embit_network["xprv"])
+        derivation_path = [0x80000000 + 86, 0x80000000 + 1, 0x80000000 + 0, 1, 0]  # change branch
+        key_a = root_a.derive(derivation_path)
+        fp_a = root_a.my_fingerprint
+
+        from embit import script as script_module
+        change_script = script_module.p2tr(key_a.to_public())
+
+        scaffold_key = root_a.derive([0x80000000 + 86, 0x80000000 + 1, 0x80000000 + 0, 0, 0])
+        scaffold_script = script_module.p2tr(scaffold_key.to_public())
+
+        tx_in = TransactionInput(bytes(32), 0)
+        tx_out = TransactionOutput(99_990_000, change_script)
+        tx = Transaction(vin=[tx_in], vout=[tx_out])
+        p = PSBT(tx)
+        p.inputs[0].witness_utxo = TransactionOutput(100_000_000, scaffold_script)
+        # Key-path-only: leaf-hash list is empty (no tap tree, no leaf).
+        p.outputs[0].taproot_bip32_derivations[key_a.to_public()] = (
+            [],
+            DerivationPath(fp_a, derivation_path),
+        )
+
+        parser = PSBTParser(p, self.seed_a, network=SettingsConstants.REGTEST)
+        assert parser.num_change_outputs == 1
+        change_data = parser.get_change_data(0)
+        assert change_data["is_taproot_script_path"] is False

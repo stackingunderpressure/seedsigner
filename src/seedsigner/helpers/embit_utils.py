@@ -1,6 +1,7 @@
 import embit
 
 from binascii import b2a_base64
+from gettext import gettext as _
 from hashlib import sha256
 
 from embit import bip32, compact, ec
@@ -97,8 +98,22 @@ def get_multisig_address(descriptor: Descriptor, index: int = 0, is_change: bool
         return descriptor.derive(index, branch_index=branch_index).script_pubkey().address(network=NETWORKS[embit_network])
 
     elif descriptor.is_taproot:
-        # TODO: Not yet implemented!
-        raise Exception("Taproot verification not yet implemented!")
+        # A taproot descriptor -- single-key (tr(key)) or a full multi-leaf
+        # miniscript tree (tr(key,{...}), e.g. a tr_multileaf inheritance
+        # vault with a separate leaf per spending path). embit's own
+        # Descriptor.derive()/.address() already do the full BIP341 tweak
+        # (internal key + tap tree -> output key -> address) correctly for
+        # both a wildcard-ranged descriptor and a fixed (non-ranged) one --
+        # for a fixed descriptor derive() at any index/branch is a safe
+        # no-op that returns the same address, matching a design like
+        # DynastyTrust's where the whole "wallet" is one immutable address
+        # and change returns to that same address (branch_index is
+        # meaningless there, not wrong). Verified directly against embit
+        # 0.8.0 before writing this: see test_get_multisig_address's new
+        # taproot vectors below, independently cross-checked against the
+        # BIP341 tap-tree math in psbt_parser.py rather than trusting
+        # embit's own output blindly.
+        return descriptor.derive(index, branch_index=branch_index).address(network=NETWORKS[embit_network])
 
     raise Exception(f"{descriptor.script_pubkey().script_type()} address verification not yet implemented!")
 
@@ -109,6 +124,55 @@ def get_multisig_policy(descriptor: Descriptor) -> tuple:
     if not descriptor.is_basic_multisig:
         raise ValueError(f"Expected a basic multisig descriptor, got: {descriptor.brief_policy}")
     return (str(descriptor.miniscript.args[0]), str(len(descriptor.keys)))
+
+
+
+def is_taproot_miniscript_wallet(descriptor: Descriptor) -> bool:
+    """
+    True for a taproot descriptor that's a genuine multi-key/multi-leaf policy
+    (e.g. tr(key,{multi_a(2,A,B),pk(C)}), a tr_multileaf inheritance vault) --
+    as opposed to a single-key tr(key) descriptor, which isn't a "wallet" to
+    register in the sense this module means (no signer set to track).
+    """
+    return descriptor.is_taproot and len(descriptor.keys) > 1
+
+
+
+def _count_tap_leaves(tree) -> int:
+    """
+    Recursively counts the script leaves in an embit TapTree. BIP371's tree
+    is a binary merkle tree -- an internal node's `.tree` is a 2-tuple of
+    child TapTree nodes; a leaf's `.tree` is the leaf's own miniscript/script
+    object (not a tuple). `descriptor.taptree` is falsy for a single-key
+    tr(key) descriptor with no leaves at all.
+    """
+    if tree is None:
+        return 0
+    if isinstance(tree.tree, tuple):
+        return sum(_count_tap_leaves(child) for child in tree.tree)
+    return 1
+
+
+
+def get_taproot_policy_summary(descriptor: Descriptor) -> str:
+    """
+    Human-readable summary for a registered taproot multi-leaf descriptor.
+
+    Unlike basic multisig, a multi-leaf taproot policy doesn't reduce to a
+    single "M of N" -- a tr_multileaf inheritance vault has a DIFFERENT
+    threshold on each leaf (e.g. 2-of-3 trustees now, 2-of-3 heirs after a
+    timelock). get_multisig_policy() intentionally keeps raising for this
+    shape (its (threshold, n) contract can't express it and existing
+    callers rely on that); this is the taproot-specific counterpart the
+    registration screen calls instead.
+    """
+    if not descriptor.is_taproot:
+        raise ValueError(f"Expected a taproot descriptor, got: {descriptor.brief_policy}")
+    num_leaves = _count_tap_leaves(descriptor.taptree)
+    return _("Taproot, {num_keys} keys, {num_leaves} leaves").format(
+        num_keys=len(descriptor.keys),
+        num_leaves=num_leaves,
+    )
 
 
 

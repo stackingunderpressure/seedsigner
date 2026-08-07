@@ -555,6 +555,28 @@ class PSBTParser():
         change_data = self.get_change_data(change_num)
         i = change_data["output_index"]
         output = self.psbt.outputs[i]
+
+        if descriptor.is_taproot and not descriptor.is_wildcard:
+            # embit 0.8.0's AllowedDerivation.check_derivation() (what
+            # Descriptor.owns() relies on to match a PSBT's claimed
+            # derivation against a registered key) only reports a match
+            # when the key's allowed-derivation suffix contains a
+            # wildcard: it only sets its `idx` return value inside the
+            # wildcard branch of its loop, so a FIXED suffix like
+            # DynastyTrust's own [fp/path]xpub/0/0 descriptors (no `*`
+            # at all -- see get_multisig_address's taproot branch above)
+            # leaves `idx` at None even on an exact index match, and
+            # owns() always reports False regardless of whether the
+            # output is really ours. A fully fixed (non-wildcard)
+            # taproot descriptor only ever resolves to ONE address --
+            # derive() at any index/branch is a proven no-op for it --
+            # so comparing that address's script directly against the
+            # real output is both sufficient and immune to this embit
+            # limitation. Wildcard descriptors are unaffected by the bug
+            # (a real wildcard element does set `idx`) and keep using
+            # owns() below.
+            return descriptor.derive(0, branch_index=0).script_pubkey() == output.script_pubkey
+
         is_owner = descriptor.owns(output)
         # print(f"{self.psbt.tx.vout[i].script_pubkey.address()} | {output.value} | {is_owner}")
         return is_owner

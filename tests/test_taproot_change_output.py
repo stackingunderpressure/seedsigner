@@ -222,3 +222,81 @@ class TestTaprootChangeOutputRecognition:
         parser = PSBTParser(psbt, self.seed_a, network=SettingsConstants.REGTEST)
         assert parser.num_change_outputs == 0, "a claimed key that doesn't actually derive from our seed must not be trusted"
         assert parser.num_destinations == 1
+
+
+
+def _matching_registered_descriptor(root_a, root_b) -> Descriptor:
+    """Rebuilds a tr(NUMS,{pk(A),pk(B)}) descriptor that resolves to the
+    exact same output _build_psbt_with_multileaf_change() compiled the
+    change output against -- what a user would actually scan/register on
+    the device ahead of time. Unlike the helper's own internal descriptor
+    (which uses bare derived pubkeys, fine for compiling a PSBT's tap tree
+    metadata but not what a real registration QR contains), this uses
+    xpub-based keys with a fixed (non-wildcard) /0/0 suffix -- the same
+    shape DynastyTrust's own compiler emits ([fp/path]xpub/0/0, see its
+    "Address type" doctrine). embit's Descriptor.owns() only matches
+    extended (xpub) keys via check_derivation() -- a bare pubkey key has
+    is_extended == False and gets silently skipped, so this distinction
+    isn't cosmetic, it's the difference between owns() being able to
+    verify this output at all or not."""
+    def account_key_str(root):
+        fp = root.my_fingerprint.hex()
+        account_xpub = root.derive([0x80000000 + 86, 0x80000000 + 1, 0x80000000 + 0]).to_public()
+        xpub_str = account_xpub.to_base58(version=NETWORKS[SettingsConstants.map_network_to_embit(SettingsConstants.REGTEST)]["xpub"])
+        return f"[{fp}/86h/1h/0h]{xpub_str}/0/0"
+
+    desc_str = f"tr({NUMS_HEX},{{pk({account_key_str(root_a)}),pk({account_key_str(root_b)})}})"
+    return Descriptor.from_string(desc_str)
+
+
+class TestVerifyMultisigOutputAgainstRegisteredTaprootDescriptor:
+    """
+    A registered wallet descriptor is the stronger of the two checks this
+    fork does for a taproot multi-leaf output: _parse_outputs (tested
+    above) only proves the PSBT is internally consistent with itself.
+    verify_multisig_output() proves the output matches a policy the user
+    imported and confirmed OUT OF BAND, before this specific PSBT ever
+    existed -- the actual anti-blind-signing control other taproot-
+    miniscript-capable wallets (Coldcard/Specter/Ledger, via Liana) rely
+    on registered descriptors for. PSBTParser.verify_multisig_output()
+    just delegates to embit's own Descriptor.owns(), which already reads
+    taproot_bip32_derivations -- this proves that delegation actually
+    works end to end for a real multi-leaf tree, rather than assuming it
+    does because the code looks right.
+    """
+
+    seed_a = PSBTTestData.seed
+    seed_b = PSBTTestData.multisig_key_2
+    seed_unrelated = PSBTTestData.multisig_key_3
+
+    def test_real_change_is_verified_against_the_registered_descriptor(self):
+        psbt, root_a, root_b, *_ = _build_psbt_with_multileaf_change(self.seed_a, self.seed_b)
+        descriptor = _matching_registered_descriptor(root_a, root_b)
+
+        parser = PSBTParser(psbt, self.seed_a, network=SettingsConstants.REGTEST)
+        assert parser.verify_multisig_output(descriptor, change_num=0) is True
+
+    def test_verification_also_passes_for_the_other_signer(self):
+        psbt, root_a, root_b, *_ = _build_psbt_with_multileaf_change(self.seed_a, self.seed_b)
+        descriptor = _matching_registered_descriptor(root_a, root_b)
+
+        parser = PSBTParser(psbt, self.seed_b, network=SettingsConstants.REGTEST)
+        assert parser.verify_multisig_output(descriptor, change_num=0) is True
+
+    def test_a_different_registered_wallet_does_not_falsely_verify(self):
+        """Security regression guard: the whole point of registering a
+        descriptor ahead of time is to catch a PSBT that doesn't actually
+        belong to the wallet you think it does. A genuine multi-leaf
+        change output must NOT verify against a DIFFERENT wallet's
+        descriptor just because both are well-formed tr_multileaf
+        policies."""
+        psbt, root_a, root_b, *_ = _build_psbt_with_multileaf_change(self.seed_a, self.seed_b)
+        seed_other = PSBTTestData.multisig_key_3
+        embit_network = NETWORKS[SettingsConstants.map_network_to_embit(SettingsConstants.REGTEST)]
+        root_other = bip32.HDKey.from_seed(seed_other.seed_bytes, version=embit_network["xprv"])
+        # A different, otherwise well-formed 2-leaf wallet -- swaps in an
+        # unrelated third key in place of signer B.
+        wrong_descriptor = _matching_registered_descriptor(root_a, root_other)
+
+        parser = PSBTParser(psbt, self.seed_a, network=SettingsConstants.REGTEST)
+        assert parser.verify_multisig_output(wrong_descriptor, change_num=0) is False

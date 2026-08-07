@@ -455,3 +455,159 @@ def test_parse_derivation_path():
             assert actual_result["index"] == expected_result[3]
         else:
             assert actual_result["index"] == int(derivation_path.split("/")[-1])
+
+
+
+class TestTaprootDescriptorRegistration:
+    """
+    Descriptor registration for a taproot multi-leaf policy (e.g. a
+    DynastyTrust tr_multileaf inheritance vault) -- the missing piece
+    identified after the taproot script-path SIGNING fix: SeedSigner could
+    already sign a tapscript leaf, but scan_views.py's registration gate
+    rejected any non-basic-multisig descriptor outright (NotYetImplementedView),
+    and even past that, get_multisig_address's taproot branch just raised
+    "not yet implemented" and get_multisig_policy hard-required
+    is_basic_multisig. This class tests the replacements:
+    is_taproot_miniscript_wallet(), get_multisig_address()'s new taproot
+    branch, and get_taproot_policy_summary().
+
+    Uses the same real BIP-39 seeds as test_get_multisig_address's own
+    vectors rather than throwaway random keys, and cross-checks every
+    derived address independently against psbt_parser's own from-scratch
+    BIP341 tap-tree math (already proven correct against schnorr_verify in
+    test_taproot_scriptpath.py) instead of only checking embit's
+    Descriptor output against itself.
+    """
+
+    def _account_key_str(self, seed_words: str, path: str, fingerprint_hex: str, network: str = "test") -> str:
+        from embit.bip32 import HDKey
+        from embit.networks import NETWORKS
+        from seedsigner.models.seed import Seed
+        seed = Seed(seed_words.split())
+        root = HDKey.from_seed(seed.seed_bytes, version=NETWORKS[network]["xprv"])
+        assert root.my_fingerprint.hex() == fingerprint_hex, "test vector's own seed doesn't match its documented fingerprint"
+        account_xpub = root.derive(f"m/{path}").to_public()
+        return f"[{fingerprint_hex}/{path}]{account_xpub.to_base58(version=NETWORKS[network]['xpub'])}"
+
+    def _tr_multileaf_descriptor(self):
+        """A fixed (non-wildcard) 2-leaf taproot descriptor, the same
+        tr_multileaf shape DynastyTrust compiles: separate pk() leaves,
+        each key a fixed /0/0 child of an account-level xpub, exactly the
+        `[fp/path]xpub/0/0` form DynastyTrust's own descriptor upgrade
+        emits (see its CLAUDE.md "Address type" doctrine)."""
+        from embit.descriptor import Descriptor
+        NUMS_HEX = "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0"
+        # Same keystores as test_get_multisig_address's vectors.
+        key_a = self._account_key_str("abandon " * 11 + "about", "86h/1h/0h", "73c5da0a")
+        key_b = self._account_key_str("baby mass dust captain baby mass dust captain baby mass dust casino", "86h/1h/0h", "0be174ee")
+        desc_str = f"tr({NUMS_HEX},{{pk({key_a}/0/0),pk({key_b}/0/0)}})"
+        return Descriptor.from_string(desc_str)
+
+    def test_is_taproot_miniscript_wallet(self):
+        descriptor = self._tr_multileaf_descriptor()
+        assert embit_utils.is_taproot_miniscript_wallet(descriptor) is True
+
+        from embit.descriptor import Descriptor
+        single_key = Descriptor.from_string(
+            "tr([73c5da0a/86h/1h/0h]tpubDC5FSnBiZDMmhiuCmWAYsLwgLYrrT9rAqvTySfuCCrgsWz8wxMXUS9Tb9iVMvcRbvFcAHGkMD5Kx8koh4GquNGNTfohfk7pgjhaPCdXpoba/0/0)"
+        )
+        assert embit_utils.is_taproot_miniscript_wallet(single_key) is False
+
+        basic_multisig = Descriptor.from_string(
+            "wsh(sortedmulti(2,[8d55ff0d/48h/1h/0h/2h]tpubDDxNVWk924RTUhdkVB2uLHw1hGMPNMGufpZefhkkswjbZppVZcuMdjYKQN4ewUog9vbL6RBLFPRWcgTGT7kYP79N6thyJ43ELUs4N2szXMg/{0,1}/*,[73c5da0a/48h/1h/0h/2h]tpubDFH9dgzveyD8zTbPUFuLrGmCydNvxehyNdUXKJAQN8x4aZ4j6UZqGfnqFrD4NqyaTVGKbvEW54tsvPTK2UoSbCC1PJY8iCNiwTL3RWZEheQ/{0,1}/*,[0be174ee/48h/1h/0h/2h]tpubDEsePyLPkbxbrDiZSTTWdsviiNtiQjrvvzZnkLtG72QYLBygEsXePRsTdXi8DeMA7taCuuvoEBjUAfFrsNZeQJqfvG9fFoujYWbFPYUn7ux/{0,1}/*))#zw6cnrlk"
+        )
+        assert embit_utils.is_taproot_miniscript_wallet(basic_multisig) is False, "basic multisig has its own is_basic_multisig path, not this one"
+
+    def test_get_multisig_address_taproot_matches_independent_tap_tree_math(self):
+        """The real regression this closes: get_multisig_address's taproot
+        branch used to unconditionally raise. Cross-checks the address
+        two ways: against psbt_parser's own from-scratch BIP341 merkle
+        root + tweak reconstruction (independent of embit's Descriptor),
+        and against calling derive() a second time at a different
+        (still-fixed) index to confirm a non-wildcard descriptor really
+        is index-invariant, not coincidentally correct at index 0."""
+        from embit.descriptor.taptree import _tweak_helper
+        from embit.networks import NETWORKS
+        from embit.script import Script
+        from seedsigner.models.psbt_parser import PSBTParser
+
+        descriptor = self._tr_multileaf_descriptor()
+        address = embit_utils.get_multisig_address(descriptor, index=0, is_change=False, embit_network="test")
+        change_address = embit_utils.get_multisig_address(descriptor, index=0, is_change=True, embit_network="test")
+        assert address == change_address, "a fixed (non-wildcard) tr_multileaf vault has exactly one address; change returns to it"
+
+        # Independent cross-check: walk the descriptor's own tap tree the
+        # same way test_taproot_change_output.py's already-verified helper
+        # does (real depth/leaf_version per leaf, not a guessed constant),
+        # then re-derive the merkle root + tweaked output key via
+        # psbt_parser's own from-scratch static helpers -- a second,
+        # independent code path -- and confirm it lands on the exact same
+        # address embit_utils.get_multisig_address just returned.
+        # .taptree on the raw (un-derived) descriptor still references
+        # the parent xpubs, not the resolved /0/0 child keys -- derive()
+        # first, same as get_multisig_address itself must (see its
+        # taproot branch), then read .taptree off the derived result.
+        derived_descriptor = descriptor.derive(0, branch_index=0)
+        leaves_with_paths, _ = _tweak_helper(derived_descriptor.taptree)
+        tap_tree_entries = []
+        for leaf, path in leaves_with_paths:
+            depth = len(path) // 32
+            leaf_script = Script(leaf.miniscript.compile())
+            tap_tree_entries.append((depth, leaf.version, leaf_script))
+        our_root, _ = PSBTParser._tap_tree_merkle_root(tap_tree_entries)
+        internal_key_xonly = bytes.fromhex("50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0")
+        our_output_xonly = PSBTParser._tap_tweak_xonly(internal_key_xonly, our_root)
+        our_script = bytes([0x51, 0x20]) + our_output_xonly
+        embit_network = NETWORKS["test"]
+        our_address = Script(our_script).address(network=embit_network)
+        assert our_address == address, "independent BIP341 reconstruction must match embit's own Descriptor.derive().address()"
+
+        # Different index, still a no-op for a fixed descriptor.
+        address_at_5 = embit_utils.get_multisig_address(descriptor, index=5, is_change=False, embit_network="test")
+        assert address_at_5 == address
+
+    def test_get_multisig_address_taproot_single_sig(self):
+        """Single-key tr(key) still routes through the same taproot
+        branch (is_taproot_miniscript_wallet excludes it from the
+        *registration* gate, but get_multisig_address itself has no
+        reason to reject it -- it's the ordinary key-path taproot case)."""
+        from embit.descriptor import Descriptor
+        descriptor = Descriptor.from_string(
+            "tr([73c5da0a/86h/1h/0h]tpubDC5FSnBiZDMmhiuCmWAYsLwgLYrrT9rAqvTySfuCCrgsWz8wxMXUS9Tb9iVMvcRbvFcAHGkMD5Kx8koh4GquNGNTfohfk7pgjhaPCdXpoba/0/0)"
+        )
+        address = embit_utils.get_multisig_address(descriptor, index=0, is_change=False, embit_network="test")
+        assert address.startswith("tb1p")
+
+    def test_get_taproot_policy_summary(self):
+        descriptor = self._tr_multileaf_descriptor()
+        summary = embit_utils.get_taproot_policy_summary(descriptor)
+        # descriptor.keys includes the NUMS internal key plus both signer
+        # keys -- 3 total, not just the 2 signers.
+        assert "3 keys" in summary
+        assert "2 leaves" in summary
+        assert "Taproot" in summary
+
+        # Non-taproot descriptor should raise ValueError, mirroring
+        # get_multisig_policy's own non-basic-multisig guard.
+        from embit.descriptor import Descriptor
+        with pytest.raises(ValueError):
+            embit_utils.get_taproot_policy_summary(Descriptor.from_string(
+                "wpkh([73c5da0a/84h/1h/0h]tpubDC5FSnBiZDMmhiuCmWAYsLwgLYrrT9rAqvTySfuCCrgsWz8wxMXUS9Tb9iVMvcRbvFcAHGkMD5Kx8koh4GquNGNTfohfk7pgjhaPCdXpoba/{0,1}/*)#2aj6cvca"
+            ))
+
+    def test_get_taproot_policy_summary_counts_a_larger_tree_correctly(self):
+        """A 3-leaf tree (uneven binary tree -- 1 leaf at depth 1, 2 at
+        depth 2) to prove leaf counting walks the whole tree, not just
+        the top-level split, since a naive `len(taptree.tree)` would
+        always report 2 regardless of how deep the tree actually goes."""
+        from embit.descriptor import Descriptor
+        NUMS_HEX = "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0"
+        key_a = self._account_key_str("abandon " * 11 + "about", "86h/1h/0h", "73c5da0a")
+        key_b = self._account_key_str("baby mass dust captain baby mass dust captain baby mass dust casino", "86h/1h/0h", "0be174ee")
+        key_c = self._account_key_str("captain baby mass dust captain baby mass dust captain baby mass dutch", "86h/1h/0h", "8d55ff0d")
+        desc_str = f"tr({NUMS_HEX},{{pk({key_a}/0/0),{{pk({key_b}/0/0),pk({key_c}/0/0)}}}})"
+        descriptor = Descriptor.from_string(desc_str)
+        summary = embit_utils.get_taproot_policy_summary(descriptor)
+        # NUMS internal key + 3 signer keys = 4.
+        assert "4 keys" in summary
+        assert "3 leaves" in summary

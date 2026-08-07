@@ -122,7 +122,8 @@ class ScanView(View):
 
                 descriptor = Descriptor.from_string(descriptor_str)
 
-                if not descriptor.is_basic_multisig:
+                from seedsigner.helpers.embit_utils import is_taproot_miniscript_wallet
+                if not descriptor.is_basic_multisig and not is_taproot_miniscript_wallet(descriptor):
                     # TODO: Handle single-sig descriptors?
                     logger.info(f"Received single sig descriptor: {descriptor}")
                     return Destination(NotYetImplementedView)

@@ -599,12 +599,17 @@ class ToolsAddressExplorerAddressTypeView(View):
 
         wallet_descriptor_display_name = None
         if "wallet_descriptor" in data:
-            from seedsigner.helpers.embit_utils import get_multisig_policy
-            threshold, n = get_multisig_policy(data["wallet_descriptor"])
-            # TRANSLATOR_NOTE: Multisig policy. For a "2 / 3 multisig" policy, "threshold" = 2; "n" = 3
-            wallet_descriptor_display_name = _("{threshold} / {n} multisig").format(
-                threshold=threshold, n=n
-            )
+            descriptor = data["wallet_descriptor"]
+            if descriptor.is_taproot:
+                from seedsigner.helpers.embit_utils import get_taproot_policy_summary
+                wallet_descriptor_display_name = get_taproot_policy_summary(descriptor)
+            else:
+                from seedsigner.helpers.embit_utils import get_multisig_policy
+                threshold, n = get_multisig_policy(descriptor)
+                # TRANSLATOR_NOTE: Multisig policy. For a "2 / 3 multisig" policy, "threshold" = 2; "n" = 3
+                wallet_descriptor_display_name = _("{threshold} / {n} multisig").format(
+                    threshold=threshold, n=n
+                )
 
         script_type = data["script_type"] if "script_type" in data else None
 
@@ -687,7 +692,7 @@ class ToolsAddressExplorerAddressListView(View):
                 elif "wallet_descriptor" in data:
                     from embit.descriptor import Descriptor
                     descriptor: Descriptor = data["wallet_descriptor"]
-                    if descriptor.is_basic_multisig:
+                    if descriptor.is_basic_multisig or embit_utils.is_taproot_miniscript_wallet(descriptor):
                         for i in range(self.start_index, self.start_index + addrs_per_screen):
                             address = embit_utils.get_multisig_address(descriptor=descriptor, index=i, is_change=self.is_change, embit_network=data["embit_network"])
                             addresses.append(address)

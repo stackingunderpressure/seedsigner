@@ -2058,10 +2058,14 @@ class MultisigWalletDescriptorView(View):
             fingerprint = hexlify(key.fingerprint).decode()
             fingerprints.append(fingerprint)
         
-        from seedsigner.helpers.embit_utils import get_multisig_policy
-        threshold, n = get_multisig_policy(descriptor)
-        # TRANSLATOR_NOTE: Multisig policy. For a "2 of 3" policy, "threshold" = 2; "n" = 3
-        policy = _("{threshold} of {n}").format(threshold=threshold, n=n)
+        if descriptor.is_taproot:
+            from seedsigner.helpers.embit_utils import get_taproot_policy_summary
+            policy = get_taproot_policy_summary(descriptor)
+        else:
+            from seedsigner.helpers.embit_utils import get_multisig_policy
+            threshold, n = get_multisig_policy(descriptor)
+            # TRANSLATOR_NOTE: Multisig policy. For a "2 of 3" policy, "threshold" = 2; "n" = 3
+            policy = _("{threshold} of {n}").format(threshold=threshold, n=n)
 
         button_data = [self.OK]
         if self.controller.resume_main_flow:

@@ -299,8 +299,14 @@ class DecodeQR:
 
     @property
     def is_wallet_descriptor(self):
-        check = self.qr_type in [QRType.WALLET__SPECTER, QRType.WALLET__UR, QRType.WALLET__CONFIGFILE, QRType.WALLET__GENERIC, QRType.OUTPUT__UR]
-        
+        # ACCOUNT__UR (UR:CRYPTO-ACCOUNT, a coordinator's bundled-xpubs
+        # account export) was missing here even though get_wallet_descriptor()
+        # (below) and get_percent_complete() both already handle it --
+        # every UR:CRYPTO-ACCOUNT QR was silently never recognized as a
+        # wallet descriptor at all, regardless of what it actually
+        # contained.
+        check = self.qr_type in [QRType.WALLET__SPECTER, QRType.WALLET__UR, QRType.WALLET__CONFIGFILE, QRType.WALLET__GENERIC, QRType.OUTPUT__UR, QRType.ACCOUNT__UR]
+
         if self.qr_type in [QRType.BYTES__UR]:
             cbor = self.decoder.result_message().cbor
             raw = Bytes.from_cbor(cbor).data

@@ -70,3 +70,41 @@ class TestWalletDescriptorQrDetection:
         # non-descriptor QR types.
         assert _detect("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq") != QRType.WALLET__GENERIC
         assert _detect("abandon " * 11 + "about") != QRType.WALLET__GENERIC
+
+    def test_account_ur_is_recognized(self):
+        assert _detect("UR:CRYPTO-ACCOUNT/some-bytewords-payload") == QRType.ACCOUNT__UR
+
+
+class TestIsWalletDescriptorProperty:
+    """
+    DecodeQR.is_wallet_descriptor is the actual gate that decides whether
+    a scanned QR gets routed into the wallet-registration flow at all --
+    detect_segment_type correctly classifying a QR as QRType.ACCOUNT__UR
+    (a UR:CRYPTO-ACCOUNT export, e.g. a coordinator's "bundle several
+    xpubs into one account" QR) isn't enough by itself if this property
+    doesn't also recognize that type. get_wallet_descriptor() and
+    get_percent_complete() both already had explicit ACCOUNT__UR
+    handling; this property was the one place it got left out, so a
+    UR:CRYPTO-ACCOUNT QR would decode completely and then be silently
+    treated as "not a wallet descriptor at all."
+    """
+
+    def _decode_qr_with_type(self, qr_type):
+        decoder = DecodeQR.__new__(DecodeQR)
+        decoder.qr_type = qr_type
+        decoder.decoder = None
+        return decoder
+
+    def test_account_ur_is_recognized_as_a_wallet_descriptor(self):
+        decoder = self._decode_qr_with_type(QRType.ACCOUNT__UR)
+        assert decoder.is_wallet_descriptor is True
+
+    def test_output_ur_is_still_recognized_as_a_wallet_descriptor(self):
+        # Regression guard: ACCOUNT__UR must be ADDITIVE, not a
+        # replacement that drops OUTPUT__UR's existing coverage.
+        decoder = self._decode_qr_with_type(QRType.OUTPUT__UR)
+        assert decoder.is_wallet_descriptor is True
+
+    def test_unrelated_types_are_still_not_wallet_descriptors(self):
+        decoder = self._decode_qr_with_type(QRType.PSBT__UR2)
+        assert decoder.is_wallet_descriptor is False

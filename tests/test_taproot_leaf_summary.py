@@ -656,3 +656,131 @@ class TestMultipleLeavesAndEligibleKeyCounting:
         assert summary["multiple_leaves"] is True
         assert summary["leaf_index"] is None  # never arbitrarily pick one
         assert summary["leaf_count"] == 2
+
+
+def _build_gift_locker_psbt_and_descriptor(seed_gifter: Seed, seed_helper: Seed, seed_gift_key: Seed, signing_leaf: str):
+    """
+    "Gift Locker" shape (2026-08-08 decision: a DynastyTrust vault
+    TEMPLATE on the existing tr_multileaf compiler, not a separate wallet
+    type): a 2-of-2 "now" leaf (the gifter plus a lawyer/family-member
+    co-signer) OR a single "gifted key" that alone unlocks after a
+    specified absolute time -- no quorum on the timelocked side, just a
+    bare pk(). Distinct from the founders/recovery/inheritance fixture
+    above in one structural way worth its own test: the timelocked leaf
+    here is a bare Pk, not a MultiA, so and_v(v:after(N), pk(...))'s
+    quorum side must resolve through _parse_leaf_quorum's Pk branch, not
+    its MultiA/Multi/Sortedmulti/SortedmultiA branch.
+
+    signing_leaf is "now" or "gift". Returns (psbt, descriptor).
+    """
+    embit_network = NETWORKS[SettingsConstants.map_network_to_embit(SettingsConstants.REGTEST)]
+    root_gifter = bip32.HDKey.from_seed(seed_gifter.seed_bytes, version=embit_network["xprv"])
+    root_helper = bip32.HDKey.from_seed(seed_helper.seed_bytes, version=embit_network["xprv"])
+    root_gift_key = bip32.HDKey.from_seed(seed_gift_key.seed_bytes, version=embit_network["xprv"])
+
+    desc_str = (
+        f"tr({NUMS_HEX},{{"
+        f"multi_a(2,{_account_key_str(root_gifter)},{_account_key_str(root_helper)}),"
+        f"and_v(v:after(800000),pk({_account_key_str(root_gift_key)}))"
+        f"}})"
+    )
+    descriptor = Descriptor.from_string(desc_str)
+    derived = descriptor.derive(0, branch_index=0)
+    script_pubkey = derived.script_pubkey()
+    leaves_with_paths, merkle_root = _tweak_helper(derived.taptree)
+
+    def leaf_hash_for(leaf):
+        raw = leaf.miniscript.compile()
+        return hashes.tagged_hash("TapLeaf", bytes([leaf.version]) + Script(raw).serialize()), raw
+
+    prevout = TransactionOutput(500_000, script_pubkey)
+    tx_in = TransactionInput(bytes(32), 0)
+    tx_out = TransactionOutput(490_000, script_pubkey)
+    p = PSBT(Transaction(vin=[tx_in], vout=[tx_out]))
+    inp = p.inputs[0]
+    inp.witness_utxo = prevout
+    inp.taproot_internal_key = ec.PublicKey.from_xonly(bytes.fromhex(NUMS_HEX))
+    inp.taproot_merkle_root = merkle_root
+
+    if signing_leaf == "now":
+        leaf = next(l for l, _p in leaves_with_paths if "multi_a" in str(l.miniscript))
+        path = next(_p for l, _p in leaves_with_paths if l is leaf)
+        leaf_hash, raw_script_bytes = leaf_hash_for(leaf)
+        control_block = bytes([leaf.version]) + bytes.fromhex(NUMS_HEX) + path
+        key = root_gifter.derive(DERIVATION_PATH)
+        fp = root_gifter.my_fingerprint
+    else:
+        leaf = next(l for l, _p in leaves_with_paths if "after" in str(l.miniscript))
+        path = next(_p for l, _p in leaves_with_paths if l is leaf)
+        leaf_hash, raw_script_bytes = leaf_hash_for(leaf)
+        control_block = bytes([leaf.version]) + bytes.fromhex(NUMS_HEX) + path
+        key = root_gift_key.derive(DERIVATION_PATH)
+        fp = root_gift_key.my_fingerprint
+
+    inp.taproot_scripts[control_block] = raw_script_bytes + bytes([leaf.version])
+    inp.taproot_bip32_derivations[key.to_public()] = ([leaf_hash], DerivationPath(fp, DERIVATION_PATH))
+
+    return p, descriptor
+
+
+class TestGiftLockerVaultShape:
+    """
+    Regression guard for the exact shape decided 2026-08-08: a
+    DynastyTrust "Gift Locker" vault template built on the existing
+    tr_multileaf taproot compiler -- a 2-of-2 now-leaf (gifter + a
+    lawyer/family-member co-signer) OR a single gifted key alone,
+    unlocking after a specified absolute time. Confirmed to need zero
+    SeedSigner code changes; this test exists so that stays true as the
+    codebase evolves, not just true on the day it was checked.
+    """
+
+    seed_gifter = PSBTTestData.seed
+    seed_helper = PSBTTestData.multisig_key_2
+    seed_gift_key = PSBTTestData.multisig_key_3
+
+    def test_registration_does_not_crash_and_reports_correct_policy(self):
+        _psbt, descriptor = _build_gift_locker_psbt_and_descriptor(
+            self.seed_gifter, self.seed_helper, self.seed_gift_key, signing_leaf="now"
+        )
+        from seedsigner.helpers.embit_utils import get_taproot_policy_summary, is_taproot_miniscript_wallet
+        assert is_taproot_miniscript_wallet(descriptor) is True
+        summary = get_taproot_policy_summary(descriptor)
+        assert summary == {"num_keys": 4, "num_leaves": 2, "keypath_spendable": False}
+
+    def test_now_leaf_reports_two_of_two_with_no_timelock(self):
+        psbt, descriptor = _build_gift_locker_psbt_and_descriptor(
+            self.seed_gifter, self.seed_helper, self.seed_gift_key, signing_leaf="now"
+        )
+        parser = PSBTParser(psbt, self.seed_gifter, network=SettingsConstants.REGTEST)
+        summary = parser.get_signing_leaf_summary(registered_descriptor=descriptor)
+        assert summary["quorum_k"] == 2
+        assert summary["quorum_n"] == 2
+        assert summary["timelock_kind"] is None
+        assert summary["timelock_value"] is None
+
+    def test_gift_leaf_reports_single_key_with_absolute_timelock(self):
+        """The structurally distinct case: and_v(v:after(N), pk(...)) --
+        a bare single key, not multi_a -- on the timelocked side."""
+        psbt, descriptor = _build_gift_locker_psbt_and_descriptor(
+            self.seed_gifter, self.seed_helper, self.seed_gift_key, signing_leaf="gift"
+        )
+        parser = PSBTParser(psbt, self.seed_gift_key, network=SettingsConstants.REGTEST)
+        summary = parser.get_signing_leaf_summary(registered_descriptor=descriptor)
+        assert summary["quorum_k"] == 1
+        assert summary["quorum_n"] == 1
+        assert summary["timelock_kind"] == "after_height"
+        assert summary["timelock_value"] == 800000
+
+    def test_the_two_leaves_are_distinguishable(self):
+        """The now-leaf and gift-leaf must resolve to different
+        positions -- if this ever ties, leaf-matching isn't actually
+        distinguishing a MultiA leaf from a Pk leaf."""
+        psbt_now, descriptor = _build_gift_locker_psbt_and_descriptor(
+            self.seed_gifter, self.seed_helper, self.seed_gift_key, signing_leaf="now"
+        )
+        psbt_gift, _ = _build_gift_locker_psbt_and_descriptor(
+            self.seed_gifter, self.seed_helper, self.seed_gift_key, signing_leaf="gift"
+        )
+        now_summary = PSBTParser(psbt_now, self.seed_gifter, network=SettingsConstants.REGTEST).get_signing_leaf_summary(descriptor)
+        gift_summary = PSBTParser(psbt_gift, self.seed_gift_key, network=SettingsConstants.REGTEST).get_signing_leaf_summary(descriptor)
+        assert now_summary["leaf_index"] != gift_summary["leaf_index"]

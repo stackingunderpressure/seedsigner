@@ -41,9 +41,9 @@ def test_get_standard_derivation_path():
         (SC.TESTNET, SC.MULTISIG, SC.NESTED_SEGWIT): "m/48'/1'/0'/1'",
         (SC.REGTEST, SC.MULTISIG, SC.NESTED_SEGWIT): "m/48'/1'/0'/1'",
 
-        (SC.MAINNET, SC.MULTISIG, SC.TAPROOT): Exception,
-        (SC.TESTNET, SC.MULTISIG, SC.TAPROOT): Exception,
-        (SC.REGTEST, SC.MULTISIG, SC.TAPROOT): Exception,
+        (SC.MAINNET, SC.MULTISIG, SC.TAPROOT): "m/48'/0'/0'/3'",
+        (SC.TESTNET, SC.MULTISIG, SC.TAPROOT): "m/48'/1'/0'/3'",
+        (SC.REGTEST, SC.MULTISIG, SC.TAPROOT): "m/48'/1'/0'/3'",
 
         (SC.MAINNET, SC.MULTISIG, SC.LEGACY_P2PKH): "m/45'",
 

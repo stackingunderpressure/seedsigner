@@ -54,7 +54,18 @@ def get_standard_derivation_path(network: str = SettingsConstants.MAINNET, walle
         elif script_type == SettingsConstants.NATIVE_SEGWIT:
             return f"m/48'/{network_path}/0'/2'"
         elif script_type == SettingsConstants.TAPROOT:
-            raise Exception("Taproot multisig not yet supported")
+            # BIP-48's script_type suffix only formally defines 1' (P2SH-P2WSH)
+            # and 2' (P2WSH); there is no BIP/SLIP for multisig taproot yet.
+            # 3' is the de facto convention other coordinators (Sparrow,
+            # Liana) have already converged on for BIP-48-style multisig
+            # taproot, so new wallets don't each invent their own path and
+            # confuse the fingerprint/path-origin matching downstream tools
+            # rely on. embit's own bip32.detect_version() has no branch for
+            # script_type 3' either, so it falls through to a plain xpub/tpub
+            # -- correct here, since taproot has no SLIP-132 version-byte
+            # convention of its own (script type lives in the descriptor,
+            # e.g. tr(...), not the xpub prefix).
+            return f"m/48'/{network_path}/0'/3'"
         else:
             raise Exception("Unexpected script type")
     else:

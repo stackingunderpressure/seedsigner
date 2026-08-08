@@ -1,12 +1,22 @@
 name: Build SD Card Image (patched fork)
 
 # Builds a bootable SeedSigner OS image from THIS repo's dev branch, instead
-# of the official upstream source. Runs automatically on every push to dev
-# (always as pi0), or manually via workflow_dispatch for any board type.
+# of the official upstream source. Manual only (workflow_dispatch) -- this
+# used to also fire automatically on every push to dev, which meant every
+# small fix commit kicked off its own ~80-minute image build whether or not
+# anyone was ready to flash and test it yet (2026-08-08, operator: "every
+# time that we push to that dev branch it rebuilds the image automatically
+# ... I have tried to make sure we do it one time and then it's like oh
+# there's another thing"). These builds don't cost money on a public repo
+# (GitHub Actions minutes are free for public repos -- confirmed via the
+# Actions API's billable-minutes field reading 0 across every run of this
+# workflow), but they do cost ~80 minutes of wall-clock wait each time, so
+# batching several fixes into one deliberate build is worth doing regardless
+# of the free minutes. Trigger a build only when you're actually ready for
+# a new image: go to Actions -> "Build SD Card Image (patched fork)" -> "Run
+# workflow", pick the board type, and run it once you're done stacking up
+# fixes for this round.
 on:
-  push:
-    branches:
-      - dev
   workflow_dispatch:
     inputs:
       board_type:

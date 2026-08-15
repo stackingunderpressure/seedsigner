@@ -59,7 +59,7 @@ class Seed:
             # still diagnosable, and raise a generic, non-repeating
             # message rather than echoing repr(e) back up the call
             # stack toward the on-screen error handler.
-            logger.info(f"Could not generate seed bytes from mnemonic ({type(e).__name__})")
+            logger.info(f"Could not generate seed bytes from mnemonic ({type(e).__name__})")  # keys-never-leave: safe, logs shape not value
             raise InvalidSeedException("Invalid mnemonic")
 
 

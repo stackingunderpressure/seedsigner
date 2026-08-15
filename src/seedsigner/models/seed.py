@@ -49,8 +49,18 @@ class Seed:
         try:
             self.seed_bytes = bip39.mnemonic_to_seed(self.mnemonic_str, password=self._passphrase, wordlist=self.wordlist)
         except Exception as e:
-            logger.info(repr(e), exc_info=True)
-            raise InvalidSeedException(repr(e))
+            # Security audit, 2026-08-15: embit's ValueError for an
+            # invalid word embeds the actual word (e.g. "Word 'xyzzy' is
+            # not in the dictionary") -- logging repr(e) at the default
+            # INFO level wrote a fragment of the mnemonic to the
+            # persisted log/journal on every mistyped or corrupted
+            # mnemonic entry, including a bad SeedQR scan. Log only the
+            # exception TYPE (never its message) so a genuine bug is
+            # still diagnosable, and raise a generic, non-repeating
+            # message rather than echoing repr(e) back up the call
+            # stack toward the on-screen error handler.
+            logger.info(f"Could not generate seed bytes from mnemonic ({type(e).__name__})")
+            raise InvalidSeedException("Invalid mnemonic")
 
 
     @property

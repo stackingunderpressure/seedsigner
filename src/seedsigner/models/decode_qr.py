@@ -350,7 +350,16 @@ class DecodeQR:
                 # TODO: Convert the test suite rather than handle here?
                 s = s.decode('utf-8')
 
-            logger.debug(f"segment string: {s}")
+            # Security audit, 2026-08-15: this function is the single
+            # entry point that later classifies `s` as SEED__SEEDQR,
+            # SEED__MNEMONIC, SEED__FOUR_LETTER_MNEMONIC, or
+            # SEED__COMPACTSEEDQR -- but classification hasn't happened
+            # yet at this point, so logging the raw content here means
+            # a full mnemonic (or its compact binary encoding) gets
+            # written to stderr/the log in plaintext on every SeedQR
+            # scan whenever DEBUG logging is enabled. Length alone is
+            # enough for debugging QR-detection issues without ever
+            # putting the content itself in a log.
             logger.debug(f"segment string length: {len(s)}")
 
             # PSBT

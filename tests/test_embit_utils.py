@@ -80,7 +80,7 @@ def test_get_standard_derivation_path():
             assert func(**a_dict) == expected
 
         # test exceptions
-        else: 
+        else:
             # call with ordered params
             with pytest.raises(expected):
                 print(f"asserting {func.__name__}(*{args}) raises Exception")
@@ -94,6 +94,19 @@ def test_get_standard_derivation_path():
             print(f"asserting {func.__name__}(**{a_dict}) raises Exception")
             with pytest.raises(expected):
                 func(**a_dict)
+
+
+def test_get_dynastytrust_legacy_recovery_derivation_path():
+    """
+    tests seedsigner.helpers.embit_utils.get_dynastytrust_legacy_recovery_derivation_path()
+    """
+    assert embit_utils.get_dynastytrust_legacy_recovery_derivation_path() == "m/84'/0'/900000'/1/0"
+    assert embit_utils.get_dynastytrust_legacy_recovery_derivation_path(SC.MAINNET) == "m/84'/0'/900000'/1/0"
+    assert embit_utils.get_dynastytrust_legacy_recovery_derivation_path(SC.TESTNET) == "m/84'/1'/900000'/1/0"
+    assert embit_utils.get_dynastytrust_legacy_recovery_derivation_path(SC.REGTEST) == "m/84'/1'/900000'/1/0"
+
+    with pytest.raises(Exception):
+        embit_utils.get_dynastytrust_legacy_recovery_derivation_path("invalid")
 
 
 def test_get_xpub():

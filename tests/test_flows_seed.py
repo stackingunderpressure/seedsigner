@@ -324,6 +324,7 @@ class TestSeedFlows(FlowTest):
                 FlowStep(seed_views.SeedOptionsView, button_data_selection=seed_views.SeedOptionsView.EXPORT_XPUB),
                 FlowStep(seed_views.SeedExportXpubSigTypeView, button_data_selection=sig_type),
                 FlowStep(seed_views.SeedExportXpubScriptTypeView, button_data_selection=script_type),
+                FlowStep(seed_views.SeedExportXpubCustomDerivationChoiceView, button_data_selection=seed_views.SeedExportXpubCustomDerivationChoiceView.TYPE_MANUALLY),
                 FlowStep(seed_views.SeedExportXpubCustomDerivationView, screen_return_value="m/0'/0'"),
                 FlowStep(seed_views.SeedExportXpubQRFormatView, button_data_selection=xpub_qr_format),
                 FlowStep(seed_views.SeedExportXpubWarningView, screen_return_value=0),

@@ -747,13 +747,66 @@ class SeedExportXpubScriptTypeView(View):
             args["script_type"] = button_data[selected_menu_num].return_data
 
             if args["script_type"] == SettingsConstants.CUSTOM_DERIVATION:
-                return Destination(SeedExportXpubCustomDerivationView, view_args=args)
+                return Destination(SeedExportXpubCustomDerivationChoiceView, view_args=args)
 
             if self.controller.resume_main_flow == Controller.FLOW__ADDRESS_EXPLORER:
                 del args["sig_type"]
                 return Destination(ToolsAddressExplorerAddressTypeView, view_args=args)
             else:
                 return Destination(SeedExportXpubQRFormatView, view_args=args)
+
+
+
+class SeedExportXpubCustomDerivationChoiceView(View):
+    """
+    "Custom Derivation" was selected. Offer a one-tap preset for
+    DynastyTrust's fixed Legacy Recovery identity path alongside typing
+    any other path by hand. This is a per-export menu choice, not a
+    Settings toggle -- nothing persists past this one screen, so it has
+    to be picked again the next time Custom Derivation is used, same as
+    every other button on this screen.
+    """
+    TYPE_MANUALLY = ButtonOption("Type manually")
+    DYNASTYTRUST_LEGACY_RECOVERY = ButtonOption("DynastyTrust Legacy Recovery")
+
+    def __init__(self, seed: Seed, sig_type: str, script_type: str):
+        super().__init__()
+        self.seed = seed
+        self.sig_type = sig_type
+        self.script_type = script_type
+
+
+    def run(self):
+        from seedsigner.controller import Controller
+
+        button_data = [self.TYPE_MANUALLY, self.DYNASTYTRUST_LEGACY_RECOVERY]
+
+        selected_menu_num = self.run_screen(
+            ButtonListScreen,
+            title=_("Custom Derivation"),
+            is_button_text_centered=False,
+            button_data=button_data,
+        )
+
+        if selected_menu_num == RET_CODE__BACK_BUTTON:
+            return Destination(BackStackView)
+
+        args = {"seed": self.seed, "sig_type": self.sig_type, "script_type": self.script_type}
+
+        if button_data[selected_menu_num] == self.DYNASTYTRUST_LEGACY_RECOVERY:
+            from seedsigner.helpers import embit_utils
+            custom_derivation = embit_utils.get_dynastytrust_legacy_recovery_derivation_path(
+                network=self.settings.get_value(SettingsConstants.SETTING__NETWORK)
+            )
+
+            if self.controller.resume_main_flow == Controller.FLOW__ADDRESS_EXPLORER:
+                from .tools_views import ToolsAddressExplorerAddressTypeView
+                return Destination(ToolsAddressExplorerAddressTypeView, view_args=dict(seed=self.seed, script_type=self.script_type, custom_derivation=custom_derivation))
+
+            args["custom_derivation"] = custom_derivation
+            return Destination(SeedExportXpubQRFormatView, view_args=args)
+
+        return Destination(SeedExportXpubCustomDerivationView, view_args=args)
 
 
 

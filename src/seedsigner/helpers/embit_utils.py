@@ -73,6 +73,27 @@ def get_standard_derivation_path(network: str = SettingsConstants.MAINNET, walle
 
 
 
+def get_dynastytrust_legacy_recovery_derivation_path(network: str = SettingsConstants.MAINNET) -> str:
+    """
+    DynastyTrust's Legacy Recovery identity key: one fixed account per
+    network, m/84'/<coin>'/900000'/1/0. See that project's
+    legacy-recovery.ts for the full mechanism -- 900000 is a hardcoded
+    offset chosen there to sit well outside any wallet's normally-used
+    account range, and the account level is still hardened, so this path
+    is only ever computable from the real seed. Exporting the account-level
+    xpub at exactly this path lets a hardware-only keyholder seal a Legacy
+    Recovery share without ever exposing their real vault-signing xpub.
+    """
+    if network == SettingsConstants.MAINNET:
+        network_path = "0'"
+    elif network in (SettingsConstants.TESTNET, SettingsConstants.REGTEST):
+        network_path = "1'"
+    else:
+        raise Exception("Unexpected network")
+    return f"m/84'/{network_path}/900000'/1/0"
+
+
+
 def get_xpub(seed_bytes, derivation_path: str, embit_network: str = "main") -> HDKey:
     root = bip32.HDKey.from_seed(seed_bytes, version=NETWORKS[embit_network]["xprv"])
     xprv = root.derive(derivation_path)

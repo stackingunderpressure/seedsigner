@@ -151,7 +151,12 @@ class PSBTOverviewView(View):
             self.controller.psbt_seed = None
             return Destination(BackStackView)
 
-        return PSBTOverviewView._route_after_overview(psbt_parser, self.controller.multisig_wallet_descriptor)
+        # Show the transaction-check fingerprint before anything else --
+        # confirming this device parsed the exact same bytes the
+        # coordinator is showing is the one thing worth checking before
+        # trusting any of the amount/address/leaf detail screens that
+        # follow it.
+        return Destination(PSBTTransactionCheckView)
 
 
     @staticmethod
@@ -204,6 +209,55 @@ class PSBTOverviewView(View):
 
         else:
             return Destination(PSBTMathView)
+
+
+
+class PSBTTransactionCheckView(View):
+    """
+    Shows a short, deterministic fingerprint of exactly which
+    transaction is about to be reviewed, before any of the amount/
+    address/leaf detail screens that follow. Meant to be eyeballed
+    against the same value shown on the coordinator's screen.
+
+    The fingerprint is Transaction.txid() -- the standard double-SHA256
+    hash over version/inputs/outputs/locktime, deliberately excluding
+    witness data. That exclusion is exactly why this works as a
+    cross-device check at all: for this fork's Taproot-only vaults, a
+    signature only ever lives in the witness, so this same hash is
+    produced whether zero, some, or all required signatures are already
+    present -- the coordinator and every signer compute the identical
+    value from the identical PSBT regardless of round-trip order.
+
+    What a match proves: this device parsed byte-for-byte the same
+    transaction the coordinator is showing -- catches a corrupted QR
+    transfer, a stale cached frame, or a swapped-in different proposal.
+
+    What a match does NOT prove: that the transaction is honest. A
+    compromised coordinator could show a fake destination/amount on its
+    OWN screen while sending the real (malicious) transaction here --
+    the fingerprint would still match, since both sides are hashing the
+    coordinator's own bytes either way. This screen is a fast
+    supplementary check, never a substitute for reading the actual
+    amounts and addresses on the screens that follow it.
+    """
+    def run(self):
+        from seedsigner.gui.screens.psbt_screens import PSBTTransactionCheckScreen
+        psbt_parser: PSBTParser = self.controller.psbt_parser
+
+        if not psbt_parser:
+            return Destination(MainMenuView)
+
+        txid_hex = psbt_parser.psbt.tx.txid().hex()
+
+        selected_menu_num = self.run_screen(
+            PSBTTransactionCheckScreen,
+            fingerprint=txid_hex[:8],
+        )
+
+        if selected_menu_num == RET_CODE__BACK_BUTTON:
+            return Destination(BackStackView)
+
+        return PSBTOverviewView._route_after_overview(psbt_parser, self.controller.multisig_wallet_descriptor)
 
 
 

@@ -484,6 +484,47 @@ def _format_relative_duration(seconds: int) -> str:
 
 
 @dataclass
+class PSBTTransactionCheckScreen(ButtonListScreen):
+    """
+    A short, deterministic fingerprint of exactly which transaction is
+    about to be reviewed -- meant to be compared, digit by digit,
+    against the same value the coordinator shows before trusting
+    anything else that follows. See PSBTTransactionCheckView's header
+    for exactly what a match does and does not prove.
+    """
+    fingerprint: str = ""
+
+    def __post_init__(self):
+        self.title = _("Transaction Check")
+        self.is_bottom_list = True
+        self.button_data = [ButtonOption("Continue")]
+        super().__post_init__()
+
+        screen_y = self.top_nav.height + GUIConstants.COMPONENT_PADDING
+
+        self.components.append(TextArea(
+            text=_("Compare this to what your coordinator shows before continuing:"),
+            screen_y=screen_y,
+            is_text_centered=True,
+        ))
+        screen_y = self.components[-1].screen_y + self.components[-1].height + 2 * GUIConstants.COMPONENT_PADDING
+
+        # Grouped in two halves (e.g. "a1b2 c3d4") -- easier to hold in
+        # short-term memory while glancing back and forth between two
+        # screens than eight characters read as one unbroken string.
+        display_value = self.fingerprint[:8]
+        grouped = f"{display_value[:4]} {display_value[4:]}" if len(display_value) == 8 else display_value
+        self.components.append(TextArea(
+            text=grouped,
+            font_name=GUIConstants.FIXED_WIDTH_EMPHASIS_FONT_NAME,
+            font_size=32,
+            screen_y=screen_y,
+            is_text_centered=True,
+        ))
+
+
+
+@dataclass
 class PSBTSpendPathScreen(ButtonListScreen):
     """
     Shown only for a taproot script-path (tapscript leaf) signature --

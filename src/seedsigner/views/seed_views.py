@@ -2164,7 +2164,6 @@ class LoadMultisigWalletDescriptorView(View):
 
 
 class MultisigWalletDescriptorView(View):
-    POLICY_DETAILS = ButtonOption("Policy details")
     RETURN = ButtonOption("Return to transaction")
     VERIFY_ADDR = ButtonOption("Verify addr")
     ADDRESS_EXPLORER = ButtonOption("Address explorer")
@@ -2191,26 +2190,6 @@ class MultisigWalletDescriptorView(View):
 
         policy = get_descriptor_policy_display_name(descriptor)
 
-        # A "Policy details" detour is only offered for a REAL multi-leaf
-        # taproot policy -- the one-line policy summary above already says
-        # everything there is to say for single-sig/basic-multisig, and a
-        # single-leaf taproot wallet has nothing to break down either.
-        # This is exactly the "raw nested-parens policy is illegible"
-        # problem: without this, the only place to see each leaf's own
-        # quorum and timelock was the signing-time PSBTSpendPathScreen,
-        # which only ever shows the ONE leaf currently being spent from --
-        # never the whole policy, and never before a real PSBT exists.
-        has_leaf_detail = False
-        if descriptor.is_taproot:
-            from seedsigner.helpers.embit_utils import get_taproot_leaf_summaries
-            try:
-                has_leaf_detail = len(get_taproot_leaf_summaries(descriptor)) > 1
-            except ValueError:
-                # Malformed/adversarial tap tree -- same degrade-quietly
-                # rule get_taproot_policy_summary itself already follows;
-                # the one-line policy summary above already handled this.
-                has_leaf_detail = False
-
         button_data = [self.OK]
         if self.controller.resume_main_flow:
             from seedsigner.controller import Controller
@@ -2222,9 +2201,6 @@ class MultisigWalletDescriptorView(View):
             elif self.controller.resume_main_flow == Controller.FLOW__ADDRESS_EXPLORER:
                 button_data = [self.ADDRESS_EXPLORER]
 
-        if has_leaf_detail:
-            button_data = [self.POLICY_DETAILS] + button_data
-
         selected_menu_num = self.run_screen(
             seed_screens.MultisigWalletDescriptorScreen,
             policy=policy,
@@ -2235,10 +2211,7 @@ class MultisigWalletDescriptorView(View):
         if selected_menu_num == RET_CODE__BACK_BUTTON:
             self.controller.multisig_wallet_descriptor = None
             return Destination(BackStackView)
-
-        elif button_data[selected_menu_num] == self.POLICY_DETAILS:
-            return Destination(MultisigWalletPolicyDetailView)
-
+        
         elif button_data[selected_menu_num] == self.RETURN:
             # Re-run the same taproot key-path/leaf disclosure check
             # PSBTOverviewView makes right after its own screen closes --
@@ -2264,62 +2237,6 @@ class MultisigWalletDescriptorView(View):
             return Destination(ToolsAddressExplorerAddressTypeView)
 
         return Destination(MainMenuView)
-
-
-
-class MultisigWalletPolicyDetailView(View):
-    """
-    Per-leaf breakdown of a registered taproot descriptor's WHOLE policy --
-    quorum and timelock for every spending path it has, not just the one
-    leaf a PSBT happens to be signing (that's PSBTSpendPathView's job, and
-    it only ever runs once a real transaction exists to sign). Reached
-    only from MultisigWalletDescriptorView's "Policy details" button,
-    which only offers this detour for a genuine multi-leaf taproot
-    policy -- see get_taproot_leaf_summaries.
-
-    Read-only detour, not a step in a longer flow: pressing Back, or
-    reaching the end of a paginated policy and pressing Continue, both
-    return to the descriptor confirmation screen either way.
-    """
-    def __init__(self, page_num: int = 0):
-        super().__init__()
-        self.page_num = page_num  # Note: zero-indexed numbering!
-
-    def run(self):
-        from seedsigner.gui.screens.seed_screens import MultisigWalletPolicyDetailScreen
-        from seedsigner.helpers.embit_utils import get_taproot_leaf_summaries
-
-        descriptor = self.controller.multisig_wallet_descriptor
-        if descriptor is None:
-            # Reached via BackStack after the registered descriptor was
-            # already cleared (e.g. MultisigWalletDescriptorView's own
-            # Back handler ran first) -- nothing left to show.
-            return Destination(MainMenuView)
-
-        try:
-            leaf_summaries = get_taproot_leaf_summaries(descriptor)
-        except ValueError:
-            leaf_summaries = []
-
-        selected_menu_num = self.run_screen(
-            MultisigWalletPolicyDetailScreen,
-            leaf_summaries=leaf_summaries,
-            page_num=self.page_num,
-        )
-
-        if selected_menu_num == RET_CODE__BACK_BUTTON:
-            if self.page_num == 0:
-                return Destination(BackStackView)
-            return Destination(MultisigWalletPolicyDetailView, view_args=dict(page_num=self.page_num - 1))
-
-        # User pressed "Next" or, on the final page, "Continue".
-        if self.page_num < self.screen.num_pages - 1:
-            return Destination(MultisigWalletPolicyDetailView, view_args=dict(page_num=self.page_num + 1))
-
-        # Reached the end -- this is a read-only detour off the descriptor
-        # confirmation screen, so it lands back there rather than pushing
-        # forward into a separate flow.
-        return Destination(BackStackView)
 
 
 

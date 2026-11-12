@@ -69,7 +69,9 @@ class TestLeafRequirement:
 
     def test_plain_shapes_have_no_must_sign_keys(self):
         a, b, c = _keys(3)
-        assert PSBTParser._parse_leaf_requirement(_ms(f"multi_a(2,{a},{b},{c})")) == {"k": 2, "n": 3, "must_sign": [], "timelock_kind": None, "timelock_value": None}
+        assert PSBTParser._parse_leaf_requirement(_ms(f"multi_a(2,{a},{b},{c})")) == {
+            "k": 2, "n": 3, "k2": None, "n2": None, "group_keys": [[_xonly(a), _xonly(b), _xonly(c)]],
+            "must_sign": [], "timelock_kind": None, "timelock_value": None}
         assert PSBTParser._parse_leaf_requirement(_ms(f"pk({a})"))["must_sign"] == []
         dated = PSBTParser._parse_leaf_requirement(_ms(f"and_v(v:multi_a(2,{a},{b}),after(950000))"))
         assert (dated["k"], dated["n"], dated["must_sign"], dated["timelock_value"]) == (2, 2, [], 950000)
@@ -77,14 +79,29 @@ class TestLeafRequirement:
         both = PSBTParser._parse_leaf_requirement(_ms(f"and_v(v:pk({a}),pk({b}))"))
         assert (both["k"], both["n"], both["must_sign"]) == (2, 2, [])
 
+    def test_two_groups_that_must_both_be_met(self):
+        """A consent gate, or "one parent and every kid": both groups are
+        reported, in script order, with the keys of each."""
+        a, b, c, d, e, f = _keys(6)
+        consent = PSBTParser._parse_leaf_requirement(_ms(f"and_v(v:multi_a(2,{a},{b},{c}),thresh(1,pk({d})))"))
+        assert (consent["k"], consent["n"], consent["k2"], consent["n2"], consent["must_sign"]) == (2, 3, 1, 1, [])
+        assert consent["group_keys"] == [[_xonly(a), _xonly(b), _xonly(c)], [_xonly(d)]]
+
+        parent_and_kids = PSBTParser._parse_leaf_requirement(_ms(f"and_v(v:multi_a(1,{a},{b}),multi_a(3,{c},{d},{e}))"))
+        assert (parent_and_kids["k"], parent_and_kids["n"], parent_and_kids["k2"], parent_and_kids["n2"]) == (1, 2, 3, 3)
+
+        with_must = PSBTParser._parse_leaf_requirement(_ms(f"and_v(v:pk({f}),and_v(v:multi_a(1,{a},{b}),multi_a(1,{c},{d})))"))
+        assert (with_must["k"], with_must["n"], with_must["k2"], with_must["n2"], with_must["must_sign"]) == (1, 2, 1, 2, [_xonly(f)])
+
     def test_shapes_it_does_not_understand_are_not_described(self):
-        a, b, c, d = _keys(4)
-        # Two groups (a consent gate): which one is "the quorum" cannot be said.
-        two_groups = PSBTParser._parse_leaf_requirement(_ms(f"and_v(v:multi_a(1,{a},{b}),multi_a(1,{c},{d}))"))
-        assert (two_groups["k"], two_groups["n"], two_groups["must_sign"]) == (None, None, [])
+        a, b, c, d, e, f = _keys(6)
+        blank = {"k": None, "n": None, "k2": None, "n2": None, "group_keys": [], "must_sign": [], "timelock_kind": None, "timelock_value": None}
+        # Three groups.
+        three = PSBTParser._parse_leaf_requirement(_ms(f"and_v(v:multi_a(1,{a},{b}),and_v(v:multi_a(1,{c},{d}),multi_a(1,{e},{f})))"))
+        assert three == blank
         # An OR.
         an_or = PSBTParser._parse_leaf_requirement(_ms(f"or_d(pk({a}),and_v(v:older(10),pk({b})))"))
-        assert an_or == {"k": None, "n": None, "must_sign": [], "timelock_kind": None, "timelock_value": None}
+        assert an_or == blank
 
     def test_the_old_tuple_never_states_k_of_n_for_a_must_sign_leaf(self):
         """_parse_leaf_quorum has no slot for must-sign keys; '1 of 2'
@@ -92,6 +109,9 @@ class TestLeafRequirement:
         h, b, c = _keys(3)
         assert PSBTParser._parse_leaf_quorum(_ms(f"and_v(v:pk({h}),multi_a(1,{b},{c}))")) == (None, None, None, None)
         assert PSBTParser._parse_leaf_quorum(_ms(f"multi_a(2,{h},{b},{c})")) == (2, 3, None, None)
+        # Nor for a second group: "1 of 2" alone would hide the other half.
+        d = _keys(4)[3]
+        assert PSBTParser._parse_leaf_quorum(_ms(f"and_v(v:multi_a(1,{h},{b}),multi_a(1,{c},{d}))")) == (None, None, None, None)
 
 
 class TestSpendPathScreenLayout:

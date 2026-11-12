@@ -557,6 +557,9 @@ class PSBTSpendPathScreen(ButtonListScreen):
     num_eligible_keys: int = 1
     must_sign_count: int = None   # keys every spend on this leaf needs, beside the quorum; None if unknown
     your_must_sign: int = None    # how many of this seed's eligible keys are among them
+    second_quorum_k: int = None   # a second key group that must ALSO be met; None if the path has one
+    second_quorum_n: int = None
+    your_groups: list = None      # [1], [2] or [1, 2]: which group(s) hold this seed's key
 
     def __post_init__(self):
         self.title = _("Spending Path")
@@ -607,8 +610,30 @@ class PSBTSpendPathScreen(ButtonListScreen):
             screen_y = self.components[-1].screen_y + self.components[-1].height + GUIConstants.COMPONENT_PADDING
 
         has_must_sign = bool(self.must_sign_count)
+        has_two_groups = self.second_quorum_k is not None and self.second_quorum_n is not None
+
+        if not self.multiple_leaves and self.leaf_index is not None and (self.quorum_k is None or self.quorum_n is None):
+            # The path was found in the descriptor but its rule is a shape
+            # this device does not know how to put into words. Silence here
+            # read as if there were nothing to say.
+            # TRANSLATOR_NOTE: Shown when the spending path is known but its signing rule cannot be displayed
+            self.components.append(TextArea(
+                text=_("This device cannot show who must sign on this path."),
+                font_size=16,
+                font_color=GUIConstants.WARNING_COLOR,
+                screen_y=screen_y,
+                is_text_centered=True,
+            ))
+            screen_y = self.components[-1].screen_y + self.components[-1].height + GUIConstants.COMPONENT_PADDING
+
         if self.quorum_k is not None and self.quorum_n is not None:
-            if has_must_sign:
+            if has_two_groups and has_must_sign:
+                # TRANSLATOR_NOTE: e.g. "1 must + 2 of 3 + 1 of 2" -- must-sign keys, plus two key groups that must both be met
+                quorum_text = _("{m} must + {k} of {n} + {k2} of {n2}").format(m=self.must_sign_count, k=self.quorum_k, n=self.quorum_n, k2=self.second_quorum_k, n2=self.second_quorum_n)
+            elif has_two_groups:
+                # TRANSLATOR_NOTE: e.g. "2 of 3 + 1 of 1" -- two key groups that must BOTH be met
+                quorum_text = _("{k} of {n} + {k2} of {n2}").format(k=self.quorum_k, n=self.quorum_n, k2=self.second_quorum_k, n2=self.second_quorum_n)
+            elif has_must_sign:
                 # TRANSLATOR_NOTE: e.g. "1 must-sign + 1 of 2" -- keys that must each sign, plus how many of the other keys
                 quorum_text = _("{m} must-sign + {k} of {n}").format(m=self.must_sign_count, k=self.quorum_k, n=self.quorum_n)
             else:
@@ -661,6 +686,14 @@ class PSBTSpendPathScreen(ButtonListScreen):
             # TRANSLATOR_NOTE: This device holds both a must-sign key and one of the other keys on this path
             eligible_text = _("Yours: must-sign + other")
             yours_color = GUIConstants.ACCENT_COLOR
+        elif has_two_groups and self.your_groups == [1]:
+            # TRANSLATOR_NOTE: e.g. "Yours: in the 2 of 3" -- which of the path's two key groups this device's key belongs to
+            eligible_text = _("Yours: in the {k} of {n}").format(k=self.quorum_k, n=self.quorum_n)
+        elif has_two_groups and self.your_groups == [2]:
+            eligible_text = _("Yours: in the {k} of {n}").format(k=self.second_quorum_k, n=self.second_quorum_n)
+        elif has_two_groups and self.your_groups == [1, 2]:
+            # TRANSLATOR_NOTE: This device holds a key in each of the path's two key groups
+            eligible_text = _("Yours: in both groups")
         elif has_must_sign:
             # TRANSLATOR_NOTE: This device's key is one of the non-must-sign keys on this path
             eligible_text = ngettext("Yours: one of the others", "Yours: among the others", self.num_eligible_keys)

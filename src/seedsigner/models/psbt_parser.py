@@ -2384,6 +2384,10 @@ class PSBTParser():
             # None until proven against a registered descriptor.
             "must_sign_count": None,   # how many keys every spend on this leaf needs
             "your_must_sign": None,    # how many of THIS seed's eligible keys are among them
+            # A second key group that must ALSO be met; None when the leaf has one.
+            "second_quorum_k": None,
+            "second_quorum_n": None,
+            "your_groups": None,       # [1], [2] or [1, 2]: which group(s) hold this seed's key
         }
 
         if registered_descriptor is None or not registered_descriptor.is_taproot or _tweak_helper is None:
@@ -2468,6 +2472,17 @@ class PSBTParser():
             # beside an unknown quorum would be half a statement.
             summary["must_sign_count"] = len(req["must_sign"])
             summary["your_must_sign"] = len(set(req["must_sign"]) & set(self.signing_leaf_pubkeys))
+            # A leaf with two key groups needs BOTH met (a consent gate, or
+            # "one parent and every kid"). your_groups says which group(s)
+            # this seed's key sits in, as 1-based positions in script order.
+            summary["second_quorum_k"] = req["k2"]
+            summary["second_quorum_n"] = req["n2"]
+            if req["k2"] is not None:
+                summary["your_groups"] = [
+                    position + 1
+                    for position, keys in enumerate(req["group_keys"])
+                    if set(keys) & set(self.signing_leaf_pubkeys)
+                ]
         return summary
 
 
@@ -2520,32 +2535,41 @@ class PSBTParser():
         What a tapscript leaf requires, read from its PARSED miniscript
         AST: an AND of
           - zero or more single keys (pk),
-          - at most one key group (multi_a / multi / sortedmulti(_a), or
+          - at most two key groups (multi_a / multi / sortedmulti(_a), or
             a thresh() made only of plain keys -- how a 1-of-1 group
             compiles),
           - at most one timelock (after / older),
         nested through and_v in any order, each operand optionally
-        wrapped in `v:`. That covers every leaf a DynastyTrust
-        path-builder vault compiles to:
+        wrapped in `v:`. That covers every leaf a DynastyTrust vault
+        compiles to:
 
           multi_a(2,A,B,C)                              2 of 3
           and_v(v:multi_a(2,A,B),after(N))              2 of 2, dated
           and_v(v:pk(H),multi_a(1,B,C))                 H must sign + 1 of 2
           and_v(v:and_v(v:pk(H),thresh(1,pk(B))),after(N))   H must sign + 1 of 1, dated
+          and_v(v:multi_a(2,A,B,C),thresh(1,pk(D)))     2 of 3 AND 1 of 1 (a consent gate)
+          and_v(v:multi_a(1,P,Q),multi_a(3,X,Y,Z))      1 of 2 AND 3 of 3 (a parent + every kid)
+
+        Two groups means BOTH must be met. The first in script order is
+        reported as k/n, the second as k2/n2.
 
         Single keys BESIDE a group are "must-sign": every spend on the
         leaf needs each of them, on top of k of the group. Single keys
         with NO group are simply an all-of-them quorum (one key: 1 of 1).
 
-        Anything else -- an OR, a hash lock, two groups, two timelocks --
+        Anything else -- an OR, a hash lock, three groups, two timelocks --
         is not described at all: k/n stay None and must_sign stays
         empty, rather than a best-effort guess. A lone timelock that WAS
         understood is still reported, as before.
 
-        Returns {"k", "n", "must_sign": [xonly bytes], "timelock_kind",
-        "timelock_value"}.
+        Returns {"k", "n", "k2", "n2", "group_keys": [[xonly], [xonly]],
+        "must_sign": [xonly bytes], "timelock_kind", "timelock_value"}.
+        k2/n2 are None for a leaf with one group.
         """
-        result = {"k": None, "n": None, "must_sign": [], "timelock_kind": None, "timelock_value": None}
+        def _blank(timelock_kind=None, timelock_value=None):
+            return {"k": None, "n": None, "k2": None, "n2": None, "group_keys": [], "must_sign": [], "timelock_kind": timelock_kind, "timelock_value": timelock_value}
+
+        result = _blank()
         if AndV is None:
             return result
 
@@ -2578,29 +2602,34 @@ class PSBTParser():
             try:
                 result["timelock_kind"], result["timelock_value"] = PSBTParser._decode_timelock(timelocks[0])
             except (ValueError, IndexError):
-                return {"k": None, "n": None, "must_sign": [], "timelock_kind": None, "timelock_value": None}
+                return _blank()
         elif len(timelocks) > 1:
             return result
 
-        if unknown or len(groups) > 1:
+        if unknown or len(groups) > 2:
             if not timelocks:
                 # Nothing about this leaf was understood.
-                return {"k": None, "n": None, "must_sign": [], "timelock_kind": None, "timelock_value": None}
+                return _blank()
             return result
 
         try:
             if groups:
-                k_node, keys = groups[0]
-                k = int(str(k_node))
-                if k < 1 or k > len(keys):
-                    return result
+                parsed = []
+                for k_node, keys in groups:
+                    k = int(str(k_node))
+                    if k < 1 or k > len(keys):
+                        return result
+                    parsed.append((k, [key.xonly() for key in keys]))
                 must = [key.xonly() for key in singles]
-                result["k"], result["n"], result["must_sign"] = k, len(keys), must
+                result["k"], result["n"], result["must_sign"] = parsed[0][0], len(parsed[0][1]), must
+                result["group_keys"] = [keys for _, keys in parsed]
+                if len(parsed) == 2:
+                    result["k2"], result["n2"] = parsed[1][0], len(parsed[1][1])
             elif singles:
                 result["k"] = result["n"] = len(singles)
         except Exception:
             logger.info("Could not read a leaf's keys", exc_info=True)
-            return {"k": None, "n": None, "must_sign": [], "timelock_kind": result["timelock_kind"], "timelock_value": result["timelock_value"]}
+            return _blank(result["timelock_kind"], result["timelock_value"])
         return result
 
 
@@ -2634,7 +2663,7 @@ class PSBTParser():
         module-level try/except above).
         """
         req = PSBTParser._parse_leaf_requirement(node)
-        if req["must_sign"]:
+        if req["must_sign"] or req["k2"] is not None:
             # This tuple has no slot for must-sign keys, and "k of n"
             # alone would understate what the leaf needs. Callers that
             # can show must-sign keys use _parse_leaf_requirement.

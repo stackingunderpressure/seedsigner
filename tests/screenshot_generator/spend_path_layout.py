@@ -33,6 +33,13 @@ WORST_CASES = [
     dict(leaf_index=2, leaf_count=3, quorum_k=1, quorum_n=1, timelock_kind="after_height", timelock_value=900000, num_eligible_keys=1, must_sign_count=1, your_must_sign=0),
     dict(leaf_index=12, leaf_count=12, quorum_k=3, quorum_n=5, timelock_kind="older_blocks", timelock_value=52560, num_eligible_keys=2, must_sign_count=2, your_must_sign=0),
     dict(leaf_index=2, leaf_count=3, quorum_k=2, quorum_n=3, timelock_kind="after_time", timelock_value=1767225600, num_eligible_keys=2, must_sign_count=2, your_must_sign=1),
+    # Two key groups that must both be met (a consent gate; a parent plus every kid).
+    dict(leaf_index=1, leaf_count=3, quorum_k=2, quorum_n=3, second_quorum_k=1, second_quorum_n=1, your_groups=[1], num_eligible_keys=1, must_sign_count=0, your_must_sign=0),
+    dict(leaf_index=12, leaf_count=12, quorum_k=10, quorum_n=12, second_quorum_k=10, second_quorum_n=12, your_groups=[1, 2], timelock_kind="older_blocks", timelock_value=52560, num_eligible_keys=2, must_sign_count=0, your_must_sign=0),
+    dict(leaf_index=1, leaf_count=2, quorum_k=1, quorum_n=2, second_quorum_k=1, second_quorum_n=2, your_groups=[2], timelock_kind="after_height", timelock_value=900000, num_eligible_keys=1, must_sign_count=2, your_must_sign=0),
+    dict(leaf_index=1, leaf_count=2, quorum_k=1, quorum_n=2, second_quorum_k=1, second_quorum_n=2, your_groups=[], timelock_kind="after_height", timelock_value=900000, num_eligible_keys=1, must_sign_count=1, your_must_sign=1),
+    # Path found, rule not understood.
+    dict(leaf_index=2, leaf_count=3, timelock_kind="after_height", timelock_value=900000, num_eligible_keys=1),
     dict(multiple_leaves=True, num_eligible_keys=2),
     dict(num_eligible_keys=1),
 ]
@@ -66,6 +73,22 @@ class TestSpendPathScreenFits:
         # A path with no must-sign keys reads exactly as it did.
         assert texts(num_eligible_keys=1, must_sign_count=0, your_must_sign=0) == ["Path 1 of 3", "1 of 2 keys", "1 of your keys is eligible"]
         assert texts(num_eligible_keys=1) == ["Path 1 of 3", "1 of 2 keys", "1 of your keys is eligible"]
+
+    def test_two_groups_that_must_both_sign_are_both_shown(self, renderer):
+        """A consent gate, or "one parent and every kid": both groups are
+        named, and the holder is told which one their key is in."""
+        from seedsigner.gui.screens.psbt_screens import PSBTSpendPathScreen
+        def texts(**kw):
+            s = PSBTSpendPathScreen(leaf_index=1, leaf_count=3, quorum_k=2, quorum_n=3, second_quorum_k=1, second_quorum_n=1, num_eligible_keys=1, must_sign_count=0, your_must_sign=0, **kw)
+            return [getattr(c, "text", None) or getattr(c, "value_text", None) for c in _body(s)]
+        assert texts(your_groups=[1]) == ["Path 1 of 3", "2 of 3 + 1 of 1", "Yours: in the 2 of 3"]
+        assert texts(your_groups=[2]) == ["Path 1 of 3", "2 of 3 + 1 of 1", "Yours: in the 1 of 1"]
+        assert texts(your_groups=[1, 2]) == ["Path 1 of 3", "2 of 3 + 1 of 1", "Yours: in both groups"]
+
+    def test_a_found_path_whose_rule_is_not_understood_says_so(self, renderer):
+        from seedsigner.gui.screens.psbt_screens import PSBTSpendPathScreen
+        lines = [getattr(c, "text", None) or getattr(c, "value_text", None) for c in _body(PSBTSpendPathScreen(leaf_index=2, leaf_count=3, num_eligible_keys=1))]
+        assert lines == ["Path 2 of 3", "This device cannot show who must sign on this path.", "1 of your keys is eligible"]
 
     def test_an_unidentified_path_says_what_is_missing(self, renderer):
         """No matching descriptor loaded: the device cannot show the

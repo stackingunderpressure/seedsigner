@@ -381,6 +381,9 @@ class PSBTSpendPathView(View):
             num_eligible_keys=summary["num_eligible_keys"],
             must_sign_count=summary.get("must_sign_count"),
             your_must_sign=summary.get("your_must_sign"),
+            second_quorum_k=summary.get("second_quorum_k"),
+            second_quorum_n=summary.get("second_quorum_n"),
+            your_groups=summary.get("your_groups"),
         )
 
         if selected_menu_num == RET_CODE__BACK_BUTTON:

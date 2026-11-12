@@ -473,7 +473,8 @@ class PSBTAddressDetailsView(View):
 
 class PSBTChangeDetailsView(View):
     NEXT = ButtonOption("Next")
-    SKIP_VERIFICATION = ButtonOption("Skip verification")
+    # Says what skipping costs: the change address goes unchecked.
+    SKIP_VERIFICATION = ButtonOption("Skip (not verified)")
     VERIFY_MULTISIG = ButtonOption("Verify multisig change")
 
     def __init__(self, change_address_num):
@@ -522,7 +523,9 @@ class PSBTChangeDetailsView(View):
             title = _("Your Change")
         else:
             title = _("Self-Transfer")
-            self.VERIFY_MULTISIG.button_label = _("Verify multisig addr")
+            # What the button does: it opens the descriptor loader. A taproot
+            # vault is not "multisig" to the person holding the device.
+            self.VERIFY_MULTISIG.button_label = _("Load descriptor")
         # if psbt_parser.num_change_outputs > 1:
         #     title += f" (#{self.change_address_num + 1})"
 

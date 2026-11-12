@@ -103,3 +103,12 @@ class TestSpendPathScreenLayout:
             cwd=os.path.dirname(here), capture_output=True, text=True,
         )
         assert result.returncode == 0, result.stdout[-3000:] + result.stderr[-1000:]
+
+
+class TestChangeScreenButtonsSayWhatTheyDo:
+    def test_labels(self):
+        from seedsigner.views.psbt_views import PSBTChangeDetailsView
+        assert PSBTChangeDetailsView.SKIP_VERIFICATION.button_label == "Skip (not verified)"
+        import inspect
+        src = inspect.getsource(PSBTChangeDetailsView)
+        assert '_("Load descriptor")' in src and "Verify multisig addr" not in src

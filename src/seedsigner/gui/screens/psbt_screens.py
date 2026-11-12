@@ -575,6 +575,23 @@ class PSBTSpendPathScreen(ButtonListScreen):
         ))
         screen_y = self.components[-1].screen_y + self.components[-1].height + GUIConstants.COMPONENT_PADDING
 
+        if not self.multiple_leaves and self.leaf_index is None:
+            # No registered descriptor matched this spend, so nothing
+            # below can say how many signers the path needs, whether this
+            # device's key is a must-sign one, or when the path opens.
+            # "1 of your keys is eligible" on its own read as if all was
+            # well. Say what is missing and how to get it; signing is
+            # still allowed, as in stock SeedSigner.
+            # TRANSLATOR_NOTE: Shown when the wallet's descriptor is not loaded, so the spending path's rules cannot be displayed
+            self.components.append(TextArea(
+                text=_("This device cannot see who must sign or when this path opens. Load the vault's descriptor first."),
+                font_size=16,
+                font_color=GUIConstants.WARNING_COLOR,
+                screen_y=screen_y,
+                is_text_centered=True,
+            ))
+            screen_y = self.components[-1].screen_y + self.components[-1].height + GUIConstants.COMPONENT_PADDING
+
         has_must_sign = bool(self.must_sign_count)
         if self.quorum_k is not None and self.quorum_n is not None:
             if has_must_sign:

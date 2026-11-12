@@ -66,3 +66,17 @@ class TestSpendPathScreenFits:
         # A path with no must-sign keys reads exactly as it did.
         assert texts(num_eligible_keys=1, must_sign_count=0, your_must_sign=0) == ["Path 1 of 3", "1 of 2 keys", "1 of your keys is eligible"]
         assert texts(num_eligible_keys=1) == ["Path 1 of 3", "1 of 2 keys", "1 of your keys is eligible"]
+
+    def test_an_unidentified_path_says_what_is_missing(self, renderer):
+        """No matching descriptor loaded: the device cannot show the
+        signer count, a must-sign key or the timelock, and says so."""
+        from seedsigner.gui.screens.psbt_screens import PSBTSpendPathScreen
+        lines = [getattr(c, "text", None) or getattr(c, "value_text", None) for c in _body(PSBTSpendPathScreen(num_eligible_keys=1))]
+        assert lines == [
+            "Path not identified",
+            "This device cannot see who must sign or when this path opens. Load the vault's descriptor first.",
+            "1 of your keys is eligible",
+        ]
+        # ...and not on a path that WAS identified, nor on a multi-path spend.
+        for kw in (dict(leaf_index=1, leaf_count=3, quorum_k=2, quorum_n=3, num_eligible_keys=1), dict(multiple_leaves=True, num_eligible_keys=2)):
+            assert not any("cannot see" in (getattr(c, "text", "") or "") for c in _body(PSBTSpendPathScreen(**kw)))

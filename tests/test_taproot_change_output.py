@@ -8,7 +8,7 @@ from embit.psbt import PSBT, DerivationPath
 from embit.script import Script
 from embit.transaction import Transaction, TransactionInput, TransactionOutput
 
-from seedsigner.models.psbt_parser import PSBTParser
+from seedsigner.models.psbt_parser import PSBTParser, PSBTOutputOwnershipClaimError
 from seedsigner.models.seed import Seed
 from seedsigner.models.settings_definition import SettingsConstants
 
@@ -29,7 +29,7 @@ def _serialize_tap_tree(entries) -> bytes:
     return buf
 
 
-def _build_psbt_with_multileaf_change(seed_a: Seed, seed_b: Seed, network: str = SettingsConstants.REGTEST):
+def _build_psbt_with_multileaf_change(seed_a: Seed, seed_b: Seed, network: str = SettingsConstants.REGTEST, input_owner: Seed = None):
     """
     Builds a real PSBT with one plain single-key p2tr input (unrelated
     scaffolding, just enough to set self.policy = {"type": "p2tr"}) and
@@ -40,6 +40,11 @@ def _build_psbt_with_multileaf_change(seed_a: Seed, seed_b: Seed, network: str =
     tap_internal_key, PSBT_OUT_TAP_TREE (key 0x06, raw, since embit's
     OutputScope doesn't parse it), and taproot_bip32_derivations for
     both signer keys.
+
+    The input belongs to `input_owner` (default seed_a) and says so in its
+    taproot_bip32_derivations: since the 2026-11 upstream hardening the
+    parser refuses a psbt none of whose inputs the seed can sign, so the
+    seed under test has to own the input.
 
     Returns (psbt, root_a, root_b, tap_tree_entries, real_merkle_root,
     real_output_script) so tests can both use the well-formed PSBT and
@@ -78,7 +83,7 @@ def _build_psbt_with_multileaf_change(seed_a: Seed, seed_b: Seed, network: str =
     # the output's policy against (see PSBTParser._get_policy -- for
     # p2tr this is always just {"type": "p2tr"}, no further detail).
     from embit import script as script_module
-    scaffold_root = bip32.HDKey.from_seed(seed_a.seed_bytes, version=embit_network["xprv"])
+    scaffold_root = bip32.HDKey.from_seed((input_owner or seed_a).seed_bytes, version=embit_network["xprv"])
     scaffold_key = scaffold_root.derive([0x80000000 + 86, 0x80000000 + 1, 0x80000000 + 0, 0, 0])
     scaffold_script = script_module.p2tr(scaffold_key.to_public())
 
@@ -89,6 +94,10 @@ def _build_psbt_with_multileaf_change(seed_a: Seed, seed_b: Seed, network: str =
 
     inp = p.inputs[0]
     inp.witness_utxo = TransactionOutput(100_000_000, scaffold_script)
+    inp.taproot_bip32_derivations[scaffold_key.to_public()] = (
+        [],
+        DerivationPath(scaffold_root.my_fingerprint, DERIVATION_PATH),
+    )
 
     out = p.outputs[0]
     out.taproot_internal_key = ec.PublicKey.from_xonly(bytes.fromhex(NUMS_HEX))
@@ -154,7 +163,7 @@ class TestTaprootChangeOutputRecognition:
         assert parser.num_destinations == 0
 
     def test_change_is_recognized_for_signer_b(self):
-        psbt, root_a, root_b, *_ = _build_psbt_with_multileaf_change(self.seed_a, self.seed_b)
+        psbt, root_a, root_b, *_ = _build_psbt_with_multileaf_change(self.seed_a, self.seed_b, input_owner=self.seed_b)
         parser = PSBTParser(psbt, self.seed_b, network=SettingsConstants.REGTEST)
         assert parser.num_change_outputs == 1
         assert parser.num_destinations == 0
@@ -163,7 +172,7 @@ class TestTaprootChangeOutputRecognition:
         """A seed with no key in the tree at all must NOT be told this is
         its own change -- the honest fallback (show as destination) stays
         in place when we genuinely aren't a signer here."""
-        psbt, *_ = _build_psbt_with_multileaf_change(self.seed_a, self.seed_b)
+        psbt, *_ = _build_psbt_with_multileaf_change(self.seed_a, self.seed_b, input_owner=self.seed_unrelated)
         parser = PSBTParser(psbt, self.seed_unrelated, network=SettingsConstants.REGTEST)
         assert parser.num_change_outputs == 0
         assert parser.num_destinations == 1
@@ -219,9 +228,10 @@ class TestTaprootChangeOutputRecognition:
             DerivationPath(derivation_path.fingerprint, wrong_path),
         )
 
-        parser = PSBTParser(psbt, self.seed_a, network=SettingsConstants.REGTEST)
-        assert parser.num_change_outputs == 0, "a claimed key that doesn't actually derive from our seed must not be trusted"
-        assert parser.num_destinations == 1
+        # Since the 2026-11 upstream hardening a false claim on our seed is not
+        # merely ignored: the whole psbt is refused.
+        with pytest.raises(PSBTOutputOwnershipClaimError):
+            PSBTParser(psbt, self.seed_a, network=SettingsConstants.REGTEST)
 
 
 
@@ -277,7 +287,7 @@ class TestVerifyMultisigOutputAgainstRegisteredTaprootDescriptor:
         assert parser.verify_multisig_output(descriptor, change_num=0) is True
 
     def test_verification_also_passes_for_the_other_signer(self):
-        psbt, root_a, root_b, *_ = _build_psbt_with_multileaf_change(self.seed_a, self.seed_b)
+        psbt, root_a, root_b, *_ = _build_psbt_with_multileaf_change(self.seed_a, self.seed_b, input_owner=self.seed_b)
         descriptor = _matching_registered_descriptor(root_a, root_b)
 
         parser = PSBTParser(psbt, self.seed_b, network=SettingsConstants.REGTEST)
@@ -460,6 +470,12 @@ class TestTaprootScriptPathChangeFlagsForRegisteredDescriptorVerification:
         tx = Transaction(vin=[tx_in], vout=[tx_out])
         p = PSBT(tx)
         p.inputs[0].witness_utxo = TransactionOutput(100_000_000, scaffold_script)
+        # The parser refuses a psbt whose inputs this seed cannot sign, so the
+        # input has to say whose it is.
+        p.inputs[0].taproot_bip32_derivations[scaffold_key.to_public()] = (
+            [],
+            DerivationPath(fp_a, [0x80000000 + 86, 0x80000000 + 1, 0x80000000 + 0, 0, 0]),
+        )
         # Key-path-only: leaf-hash list is empty (no tap tree, no leaf).
         p.outputs[0].taproot_bip32_derivations[key_a.to_public()] = (
             [],

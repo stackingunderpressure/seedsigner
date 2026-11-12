@@ -19,6 +19,7 @@ from seedsigner.models.settings_definition import SettingsConstants
 from seedsigner.views import psbt_views, seed_views
 
 from psbt_testing_util import PSBTTestData
+from taproot_testing_util import control_block as taproot_control_block
 
 
 NUMS_HEX = "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0"
@@ -48,7 +49,7 @@ def _build_leaf_signing_psbt_and_descriptor(seed_a: Seed, seed_b: Seed, network:
     leaf, path = leaves_with_paths[0]
     raw_script_bytes = leaf.miniscript.compile()
     leaf_hash = hashes.tagged_hash("TapLeaf", bytes([leaf.version]) + Script(raw_script_bytes).serialize())
-    control_block = bytes([leaf.version]) + bytes.fromhex(NUMS_HEX) + path
+    control_block = taproot_control_block(leaf.version, bytes.fromhex(NUMS_HEX), merkle_root, path)
 
     prevout = TransactionOutput(100_000_000, script_pubkey)
     tx_in = TransactionInput(bytes(32), 0)

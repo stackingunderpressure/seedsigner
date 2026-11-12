@@ -11,12 +11,13 @@ from embit.script import Script
 from embit.transaction import Transaction, TransactionInput, TransactionOutput
 from embit.util import secp256k1
 
-from seedsigner.models.psbt_parser import PSBTParser
+from seedsigner.models.psbt_parser import PSBTParser, PSBTSeedCannotSignError
 from seedsigner.models.seed import Seed
 from seedsigner.models.settings_definition import SettingsConstants
 from seedsigner.views import psbt_views
 
 from psbt_testing_util import PSBTTestData
+from taproot_testing_util import control_block as taproot_control_block
 
 
 # Same NUMS point and account-level path used across the other taproot test
@@ -376,7 +377,7 @@ class TestSigningLeafSummaryBranchPositionResolution:
         leaf, path = leaves_with_paths[0]
         raw_script_bytes = leaf.miniscript.compile()
         leaf_hash = hashes.tagged_hash("TapLeaf", bytes([leaf.version]) + Script(raw_script_bytes).serialize())
-        control_block = bytes([leaf.version]) + bytes.fromhex(NUMS_HEX) + path
+        control_block = taproot_control_block(leaf.version, bytes.fromhex(NUMS_HEX), merkle_root, path)
 
         prevout = TransactionOutput(100_000_000, script_pubkey)
         tx_in = TransactionInput(bytes(32), 0)
@@ -461,17 +462,7 @@ class TestPSBTOverviewRoutingToSpendPathView:
         # No outputs on this base fixture -- just prove there's nothing
         # taproot-leaf-specific to show, which is the actual claim here.
         psbt = EmbitPSBT.parse(raw)
-        parser = PSBTParser.__new__(PSBTParser)
-        parser.psbt = psbt
-        parser.seed = PSBTTestData.seed
-        parser.network = SettingsConstants.REGTEST
-        parser.policy = None
-        parser.input_amount = 0
-        parser.num_inputs = 0
-        parser.signing_leaf_hashes = set()
-        parser.root = None
-        parser._set_root()
-        parser._parse_inputs()
+        parser = PSBTParser(psbt, PSBTTestData.seed, network=SettingsConstants.REGTEST)
         assert parser.get_signing_leaf_summary() is None
 
 
@@ -604,8 +595,11 @@ class TestKeyPathSpendDetection:
         # looked at taproot_bip32_derivations and would have missed this
         # entirely.
 
-        parser = PSBTParser(p, self.seed_a, network=SettingsConstants.REGTEST)
-        assert parser.signing_key_path is True
+        # Since the 2026-11 upstream hardening the parser treats the bare master
+        # key as a derivation root, never a spending key: an input this seed could
+        # only sign that way is refused outright, before any screen is shown.
+        with pytest.raises(PSBTSeedCannotSignError):
+            PSBTParser(p, self.seed_a, network=SettingsConstants.REGTEST)
 
 
 class TestMultipleLeavesAndEligibleKeyCounting:
@@ -706,14 +700,14 @@ def _build_gift_locker_psbt_and_descriptor(seed_gifter: Seed, seed_helper: Seed,
         leaf = next(l for l, _p in leaves_with_paths if "multi_a" in str(l.miniscript))
         path = next(_p for l, _p in leaves_with_paths if l is leaf)
         leaf_hash, raw_script_bytes = leaf_hash_for(leaf)
-        control_block = bytes([leaf.version]) + bytes.fromhex(NUMS_HEX) + path
+        control_block = taproot_control_block(leaf.version, bytes.fromhex(NUMS_HEX), merkle_root, path)
         key = root_gifter.derive(DERIVATION_PATH)
         fp = root_gifter.my_fingerprint
     else:
         leaf = next(l for l, _p in leaves_with_paths if "after" in str(l.miniscript))
         path = next(_p for l, _p in leaves_with_paths if l is leaf)
         leaf_hash, raw_script_bytes = leaf_hash_for(leaf)
-        control_block = bytes([leaf.version]) + bytes.fromhex(NUMS_HEX) + path
+        control_block = taproot_control_block(leaf.version, bytes.fromhex(NUMS_HEX), merkle_root, path)
         key = root_gift_key.derive(DERIVATION_PATH)
         fp = root_gift_key.my_fingerprint
 

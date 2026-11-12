@@ -116,11 +116,6 @@ class TestTaprootScriptPathSigning:
         wrong_seed = Seed(["bacon"] * 24)
         assert not PSBTParser.has_matching_input_fingerprint(p, wrong_seed, SettingsConstants.REGTEST)
 
-    def test_get_input_fingerprints_no_longer_raises_for_leaf_derivations(self):
-        p, root_a, root_b = _build_two_leaf_taproot_psbt(self.seed_beneficiary, self.seed_trustee)
-        fingerprints = PSBTParser.get_input_fingerprints(p)
-        assert set(fingerprints) == {root_a.my_fingerprint.hex(), root_b.my_fingerprint.hex()}
-
     def test_sign_with_produces_a_valid_schnorr_signature_per_leaf(self):
         """The actual crypto: prove sign_with() produces a real, independently
         verifiable BIP340 signature over the correct BIP341 tapscript sighash

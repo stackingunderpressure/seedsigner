@@ -136,6 +136,35 @@ class TestHonestScriptPathSpend:
         assert PSBTParser.sig_count(PSBTParser.trim(p)) == 1
 
 
+    def test_master_key_as_internal_key_beside_a_signable_input_is_flagged(self):
+        """
+        embit signs a taproot input by key path with the bare master key if the address
+        was built on it, bypassing every spending path. Alone, such an input is refused
+        (the seed "cannot sign"). Beside an input the seed can sign, the psbt goes
+        ahead, so the bypass has to be flagged for the warning screen.
+        """
+        p, _, leaves = _vault_spend(0)
+        merkle_root = p.inputs[0].taproot_merkle_root
+        root_a = _root(SEED_A)
+        bypass_script = Script(b"\x51\x20" + root_a.taproot_tweak(merkle_root).xonly())
+
+        both = PSBT(Transaction(
+            vin=[TransactionInput(bytes(32), 0), TransactionInput(bytes(32), 1)],
+            vout=[TransactionOutput(SPEND_VALUE, Script(b"\x00\x14" + bytes(20)))],
+        ))
+        for field in ("witness_utxo", "taproot_internal_key", "taproot_merkle_root"):
+            setattr(both.inputs[0], field, getattr(p.inputs[0], field))
+        both.inputs[0].taproot_scripts.update(p.inputs[0].taproot_scripts)
+        both.inputs[0].taproot_bip32_derivations.update(p.inputs[0].taproot_bip32_derivations)
+        both.inputs[1].witness_utxo = TransactionOutput(COIN_VALUE, bypass_script)
+        both.inputs[1].taproot_internal_key = root_a.to_public()
+        both.inputs[1].taproot_merkle_root = merkle_root
+
+        parser = PSBTParser(both, SEED_A, network=NETWORK)
+        assert parser.signing_key_path is True
+        assert parser.signing_leaf_hashes == {leaves[0][2]}
+
+
     def test_seed_with_no_key_in_the_supplied_path_cannot_sign(self):
         """Seed C is in the vault, but not on the path this psbt spends through."""
         from seedsigner.models.psbt_parser import PSBTSeedCannotSignError

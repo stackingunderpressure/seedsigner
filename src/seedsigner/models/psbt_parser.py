@@ -708,6 +708,16 @@ class PSBTParser():
                     # which is allowed by BIP-174 and BIP-78.
                     raise RuntimeError("Mixed inputs in the transaction")
 
+            if inp_policy["type"] == "p2tr" and inp.taproot_merkle_root:
+                # embit's sign_with() tries the bare master key as a key path signer on
+                # every taproot input, before it reads any derivation. Upstream ignores
+                # that case when deciding whether the seed can sign. This fork still has
+                # to notice it, because such a signature would bypass every spending
+                # path of an address that has a script tree.
+                master_tweaked = self.root.taproot_tweak(inp.taproot_merkle_root)
+                if b"\x51\x20" + master_tweaked.xonly() == script_pubkey.data:
+                    self.signing_key_path = True
+
             # Now check each verified claim against the input's committed script. We read
             # the entries from the input's own maps so that each taproot entry's leaf
             # hashes come with it.

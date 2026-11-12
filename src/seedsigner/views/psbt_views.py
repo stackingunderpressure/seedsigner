@@ -291,6 +291,8 @@ class PSBTSpendPathView(View):
             timelock_kind=summary["timelock_kind"],
             timelock_value=summary["timelock_value"],
             num_eligible_keys=summary["num_eligible_keys"],
+            must_sign_count=summary.get("must_sign_count"),
+            your_must_sign=summary.get("your_must_sign"),
         )
 
         if selected_menu_num == RET_CODE__BACK_BUTTON:

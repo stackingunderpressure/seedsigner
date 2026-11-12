@@ -1,0 +1,105 @@
+"""
+Must-sign keys on a spending path (DynastyTrust, 2026-11-12): a leaf may
+name keys that must EACH sign, on top of k of n others --
+and_v(v:pk(H), multi_a(k, ...)), optionally dated. Operator: "make sure
+everything is correct and the screens are obvious to what they are
+signing."
+
+Two things are held here:
+  1. PSBTParser reads that shape from the registered descriptor's parsed
+     miniscript, says how many must-sign keys the leaf has and whether
+     THIS seed's key is one of them -- and still refuses to describe a
+     shape it does not understand.
+  2. PSBTSpendPathScreen never puts a line underneath its button. A dated
+     path used to: four labelled lines did not fit on 240px and the last
+     one, "Your Keys", was hidden. The screen does not scroll. Those
+     checks need the REAL renderer, which this suite replaces with a
+     mock for every other test (tests/base.py), so they live in
+     tests/screenshot_generator/spend_path_layout.py and are run from
+     here in a process of their own.
+"""
+import os
+import subprocess
+import sys
+
+import pytest
+from embit.descriptor.miniscript import Miniscript
+
+from seedsigner.models.psbt_parser import PSBTParser
+from seedsigner.models.seed import Seed
+
+
+def _keys(n):
+    """n distinct, valid compressed public keys (hex)."""
+    root = Seed(["abandon"] * 11 + ["about"]).seed_bytes
+    from embit import bip32
+    master = bip32.HDKey.from_seed(root)
+    return [master.derive([0x80000000 + 86, 0x80000000 + 1, 0x80000000 + i, 0, 0]).to_public().sec().hex() for i in range(n)]
+
+
+def _ms(text):
+    return Miniscript.from_string(text, taproot=True)
+
+
+def _xonly(hexkey):
+    return bytes.fromhex(hexkey)[1:]
+
+
+class TestLeafRequirement:
+    def test_one_must_sign_key_beside_a_group(self):
+        h, b, c = _keys(3)
+        req = PSBTParser._parse_leaf_requirement(_ms(f"and_v(v:pk({h}),multi_a(1,{b},{c}))"))
+        assert (req["k"], req["n"]) == (1, 2)
+        assert req["must_sign"] == [_xonly(h)]
+        assert req["timelock_kind"] is None
+
+    def test_dated_must_sign_with_a_one_key_group_compiled_as_thresh(self):
+        """The exact shape the compiler emits for 'H must sign + 1 of 1, after N'."""
+        h, b = _keys(2)
+        req = PSBTParser._parse_leaf_requirement(_ms(f"and_v(v:and_v(v:pk({h}),thresh(1,pk({b}))),after(900000))"))
+        assert (req["k"], req["n"]) == (1, 1)
+        assert req["must_sign"] == [_xonly(h)]
+        assert (req["timelock_kind"], req["timelock_value"]) == ("after_height", 900000)
+
+    def test_two_must_sign_keys(self):
+        h1, h2, b, c = _keys(4)
+        req = PSBTParser._parse_leaf_requirement(_ms(f"and_v(v:pk({h1}),and_v(v:pk({h2}),multi_a(2,{b},{c})))"))
+        assert (req["k"], req["n"]) == (2, 2)
+        assert sorted(req["must_sign"]) == sorted([_xonly(h1), _xonly(h2)])
+
+    def test_plain_shapes_have_no_must_sign_keys(self):
+        a, b, c = _keys(3)
+        assert PSBTParser._parse_leaf_requirement(_ms(f"multi_a(2,{a},{b},{c})")) == {"k": 2, "n": 3, "must_sign": [], "timelock_kind": None, "timelock_value": None}
+        assert PSBTParser._parse_leaf_requirement(_ms(f"pk({a})"))["must_sign"] == []
+        dated = PSBTParser._parse_leaf_requirement(_ms(f"and_v(v:multi_a(2,{a},{b}),after(950000))"))
+        assert (dated["k"], dated["n"], dated["must_sign"], dated["timelock_value"]) == (2, 2, [], 950000)
+        # Single keys with no group are an all-of-them quorum, not "must-sign + nothing".
+        both = PSBTParser._parse_leaf_requirement(_ms(f"and_v(v:pk({a}),pk({b}))"))
+        assert (both["k"], both["n"], both["must_sign"]) == (2, 2, [])
+
+    def test_shapes_it_does_not_understand_are_not_described(self):
+        a, b, c, d = _keys(4)
+        # Two groups (a consent gate): which one is "the quorum" cannot be said.
+        two_groups = PSBTParser._parse_leaf_requirement(_ms(f"and_v(v:multi_a(1,{a},{b}),multi_a(1,{c},{d}))"))
+        assert (two_groups["k"], two_groups["n"], two_groups["must_sign"]) == (None, None, [])
+        # An OR.
+        an_or = PSBTParser._parse_leaf_requirement(_ms(f"or_d(pk({a}),and_v(v:older(10),pk({b})))"))
+        assert an_or == {"k": None, "n": None, "must_sign": [], "timelock_kind": None, "timelock_value": None}
+
+    def test_the_old_tuple_never_states_k_of_n_for_a_must_sign_leaf(self):
+        """_parse_leaf_quorum has no slot for must-sign keys; '1 of 2'
+        alone would understate what the leaf needs."""
+        h, b, c = _keys(3)
+        assert PSBTParser._parse_leaf_quorum(_ms(f"and_v(v:pk({h}),multi_a(1,{b},{c}))")) == (None, None, None, None)
+        assert PSBTParser._parse_leaf_quorum(_ms(f"multi_a(2,{h},{b},{c})")) == (2, 3, None, None)
+
+
+class TestSpendPathScreenLayout:
+    def test_layout_checks_pass_with_the_real_renderer(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        target = os.path.join(here, "screenshot_generator", "spend_path_layout.py")
+        result = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", "--no-cov", "-p", "no:cacheprovider", target],
+            cwd=os.path.dirname(here), capture_output=True, text=True,
+        )
+        assert result.returncode == 0, result.stdout[-3000:] + result.stderr[-1000:]

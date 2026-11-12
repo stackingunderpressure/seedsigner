@@ -33,11 +33,11 @@ except ImportError:
 
 try:
     from embit.descriptor.miniscript import (
-        AndV, V, After, Older, MultiA, Multi, Sortedmulti, SortedmultiA, Pk,
+        AndV, V, After, Older, MultiA, Multi, Sortedmulti, SortedmultiA, Pk, Thresh,
     )
 except ImportError:
     logger.warning("embit.descriptor.miniscript AST classes not found; taproot leaf quorum/timelock detail will be unavailable", exc_info=True)
-    AndV = V = After = Older = MultiA = Multi = Sortedmulti = SortedmultiA = Pk = None
+    AndV = V = After = Older = MultiA = Multi = Sortedmulti = SortedmultiA = Pk = Thresh = None
 
 class OPCODES:
     OP_RETURN = 106
@@ -1023,6 +1023,11 @@ class PSBTParser():
             "quorum_n": None,
             "timelock_kind": None,
             "timelock_value": None,
+            # Must-sign keys (a DynastyTrust path may name keys that
+            # must EACH sign, on top of quorum_k of quorum_n others).
+            # None until proven against a registered descriptor.
+            "must_sign_count": None,   # how many keys every spend on this leaf needs
+            "your_must_sign": None,    # how many of THIS seed's eligible keys are among them
         }
 
         if registered_descriptor is None or not registered_descriptor.is_taproot or _tweak_helper is None:
@@ -1036,7 +1041,7 @@ class PSBTParser():
         derived_leaves_cache = {}
         matched_leaf_indices = set()
         matched_leaf_count = None
-        matched_detail = None  # (leaf_index, leaf_count, k, n, timelock_kind, timelock_value)
+        matched_detail = None  # (leaf_index, leaf_count, requirement dict)
 
         for leaf_hash, raw_branch_value, address_index in self.signing_leaf_records:
             branch_position = PSBTParser._resolve_branch_position(registered_descriptor, raw_branch_value)
@@ -1075,8 +1080,7 @@ class PSBTParser():
                     continue
                 matched_leaf_indices.add(idx)
                 if matched_detail is None:
-                    k, n, timelock_kind, timelock_value = PSBTParser._parse_leaf_quorum(leaf.miniscript)
-                    matched_detail = (idx + 1, len(leaves_with_hashes), k, n, timelock_kind, timelock_value)
+                    matched_detail = (idx + 1, len(leaves_with_hashes), PSBTParser._parse_leaf_requirement(leaf.miniscript))
                 break
 
         if not matched_leaf_indices:
@@ -1096,13 +1100,18 @@ class PSBTParser():
             summary["leaf_count"] = matched_leaf_count
             return summary
 
-        leaf_index, leaf_count, k, n, timelock_kind, timelock_value = matched_detail
+        leaf_index, leaf_count, req = matched_detail
         summary["leaf_index"] = leaf_index
         summary["leaf_count"] = leaf_count
-        summary["quorum_k"] = k
-        summary["quorum_n"] = n
-        summary["timelock_kind"] = timelock_kind
-        summary["timelock_value"] = timelock_value
+        summary["quorum_k"] = req["k"]
+        summary["quorum_n"] = req["n"]
+        summary["timelock_kind"] = req["timelock_kind"]
+        summary["timelock_value"] = req["timelock_value"]
+        if req["k"] is not None:
+            # Only when the whole shape was understood: a must-sign count
+            # beside an unknown quorum would be half a statement.
+            summary["must_sign_count"] = len(req["must_sign"])
+            summary["your_must_sign"] = len(set(req["must_sign"]) & set(self.signing_leaf_pubkeys))
         return summary
 
 
@@ -1150,6 +1159,96 @@ class PSBTParser():
 
 
     @staticmethod
+    def _parse_leaf_requirement(node) -> dict:
+        """
+        What a tapscript leaf requires, read from its PARSED miniscript
+        AST: an AND of
+          - zero or more single keys (pk),
+          - at most one key group (multi_a / multi / sortedmulti(_a), or
+            a thresh() made only of plain keys -- how a 1-of-1 group
+            compiles),
+          - at most one timelock (after / older),
+        nested through and_v in any order, each operand optionally
+        wrapped in `v:`. That covers every leaf a DynastyTrust
+        path-builder vault compiles to:
+
+          multi_a(2,A,B,C)                              2 of 3
+          and_v(v:multi_a(2,A,B),after(N))              2 of 2, dated
+          and_v(v:pk(H),multi_a(1,B,C))                 H must sign + 1 of 2
+          and_v(v:and_v(v:pk(H),thresh(1,pk(B))),after(N))   H must sign + 1 of 1, dated
+
+        Single keys BESIDE a group are "must-sign": every spend on the
+        leaf needs each of them, on top of k of the group. Single keys
+        with NO group are simply an all-of-them quorum (one key: 1 of 1).
+
+        Anything else -- an OR, a hash lock, two groups, two timelocks --
+        is not described at all: k/n stay None and must_sign stays
+        empty, rather than a best-effort guess. A lone timelock that WAS
+        understood is still reported, as before.
+
+        Returns {"k", "n", "must_sign": [xonly bytes], "timelock_kind",
+        "timelock_value"}.
+        """
+        result = {"k": None, "n": None, "must_sign": [], "timelock_kind": None, "timelock_value": None}
+        if AndV is None:
+            return result
+
+        def _unwrap_v(n):
+            if isinstance(n, V) and len(n.args) == 1:
+                return n.args[0]
+            return n
+
+        singles, groups, timelocks, unknown = [], [], [], []
+
+        def _collect(n):
+            n = _unwrap_v(n)
+            if isinstance(n, AndV) and len(n.args) == 2:
+                _collect(n.args[0])
+                _collect(n.args[1])
+            elif isinstance(n, (After, Older)):
+                timelocks.append(n)
+            elif isinstance(n, Pk):
+                singles.append(n.args[0])
+            elif isinstance(n, (MultiA, Multi, Sortedmulti, SortedmultiA)):
+                groups.append((n.args[0], list(n.args[1:])))
+            elif Thresh is not None and isinstance(n, Thresh) and all(isinstance(a, Pk) for a in n.args[1:]):
+                groups.append((n.args[0], [a.args[0] for a in n.args[1:]]))
+            else:
+                unknown.append(n)
+
+        _collect(node)
+
+        if len(timelocks) == 1:
+            try:
+                result["timelock_kind"], result["timelock_value"] = PSBTParser._decode_timelock(timelocks[0])
+            except (ValueError, IndexError):
+                return {"k": None, "n": None, "must_sign": [], "timelock_kind": None, "timelock_value": None}
+        elif len(timelocks) > 1:
+            return result
+
+        if unknown or len(groups) > 1:
+            if not timelocks:
+                # Nothing about this leaf was understood.
+                return {"k": None, "n": None, "must_sign": [], "timelock_kind": None, "timelock_value": None}
+            return result
+
+        try:
+            if groups:
+                k_node, keys = groups[0]
+                k = int(str(k_node))
+                if k < 1 or k > len(keys):
+                    return result
+                must = [key.xonly() for key in singles]
+                result["k"], result["n"], result["must_sign"] = k, len(keys), must
+            elif singles:
+                result["k"] = result["n"] = len(singles)
+        except Exception:
+            logger.info("Could not read a leaf's keys", exc_info=True)
+            return {"k": None, "n": None, "must_sign": [], "timelock_kind": result["timelock_kind"], "timelock_value": result["timelock_value"]}
+        return result
+
+
+    @staticmethod
     def _parse_leaf_quorum(node) -> tuple:
         """
         Safely reads a tapscript leaf's signer quorum from its PARSED
@@ -1178,43 +1277,10 @@ class PSBTParser():
         this needs weren't importable at module load (see the
         module-level try/except above).
         """
-        if AndV is None:
-            return (None, None, None, None)
-
-        def _unwrap_v(n):
-            if isinstance(n, V) and len(n.args) == 1:
-                return n.args[0]
-            return n
-
-        timelock_kind = None
-        timelock_value = None
-
-        if isinstance(node, AndV) and len(node.args) == 2:
-            timelock_node = None
-            quorum_node = None
-            for i, arg in enumerate(node.args):
-                candidate = _unwrap_v(arg)
-                if isinstance(candidate, (After, Older)):
-                    timelock_node = candidate
-                    quorum_node = _unwrap_v(node.args[1 - i])
-                    break
-            if timelock_node is None:
-                return (None, None, None, None)
-            try:
-                timelock_kind, timelock_value = PSBTParser._decode_timelock(timelock_node)
-            except (ValueError, IndexError):
-                return (None, None, None, None)
-            node = quorum_node
-
-        if isinstance(node, (MultiA, Multi, Sortedmulti, SortedmultiA)):
-            try:
-                k = int(str(node.args[0]))
-            except (ValueError, IndexError):
-                return (None, None, None, None)
-            n = len(node.args) - 1
-            return (k, n, timelock_kind, timelock_value)
-
-        if isinstance(node, Pk):
-            return (1, 1, timelock_kind, timelock_value)
-
-        return (None, None, timelock_kind, timelock_value)
+        req = PSBTParser._parse_leaf_requirement(node)
+        if req["must_sign"]:
+            # This tuple has no slot for must-sign keys, and "k of n"
+            # alone would understate what the leaf needs. Callers that
+            # can show must-sign keys use _parse_leaf_requirement.
+            return (None, None, req["timelock_kind"], req["timelock_value"])
+        return (req["k"], req["n"], req["timelock_kind"], req["timelock_value"])

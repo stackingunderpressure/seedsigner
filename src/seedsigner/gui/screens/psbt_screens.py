@@ -541,6 +541,8 @@ class PSBTSpendPathScreen(ButtonListScreen):
     timelock_kind: str = None  # "after_height" | "after_time" | "older_blocks" | "older_time" | None
     timelock_value: int = None  # blocks for *_height/*_blocks; seconds for *_time
     num_eligible_keys: int = 1
+    must_sign_count: int = None   # keys every spend on this leaf needs, beside the quorum; None if unknown
+    your_must_sign: int = None    # how many of this seed's eligible keys are among them
 
     def __post_init__(self):
         self.title = _("Spending Path")
@@ -548,28 +550,39 @@ class PSBTSpendPathScreen(ButtonListScreen):
         self.button_data = [ButtonOption("Continue")]
         super().__post_init__()
 
+        # Up to four facts have to fit between the title and the button
+        # on a 240px screen, and this screen does not scroll: a dated
+        # path used to push its last line ("Your Keys") underneath the
+        # button. The first line carries no label (the title already
+        # says "Spending Path") and the last is a single plain line, so
+        # the worst case -- path, requirement, timelock, your key -- fits.
         screen_y = self.top_nav.height + GUIConstants.COMPONENT_PADDING
 
         if self.multiple_leaves:
             # TRANSLATOR_NOTE: This transaction signs more than one distinct spending path at once (different inputs, different leaves)
             value_text = _("Multiple paths")
         elif self.leaf_index is not None and self.leaf_count is not None:
-            # TRANSLATOR_NOTE: e.g. "Leaf 2 of 3" -- which branch of a multi-path taproot policy this signature uses
-            value_text = _("Leaf {index} of {count}").format(index=self.leaf_index, count=self.leaf_count)
+            # TRANSLATOR_NOTE: e.g. "Path 2 of 3" -- which branch of a multi-path taproot policy this signature uses
+            value_text = _("Path {index} of {count}").format(index=self.leaf_index, count=self.leaf_count)
         else:
-            value_text = _("Tapscript leaf")
-        self.components.append(IconTextLine(
-            label_text=_("Spending Path"),
-            value_text=value_text,
+            # TRANSLATOR_NOTE: A spending path this device cannot place, because the wallet's descriptor is not loaded
+            value_text = _("Path not identified")
+        self.components.append(TextArea(
+            text=value_text,
             font_size=20,
             screen_y=screen_y,
             is_text_centered=True,
         ))
         screen_y = self.components[-1].screen_y + self.components[-1].height + GUIConstants.COMPONENT_PADDING
 
+        has_must_sign = bool(self.must_sign_count)
         if self.quorum_k is not None and self.quorum_n is not None:
-            # TRANSLATOR_NOTE: e.g. "2 of 3 keys" -- how many signatures this leaf requires
-            quorum_text = _("{k} of {n} keys").format(k=self.quorum_k, n=self.quorum_n)
+            if has_must_sign:
+                # TRANSLATOR_NOTE: e.g. "1 must-sign + 1 of 2" -- keys that must each sign, plus how many of the other keys
+                quorum_text = _("{m} must-sign + {k} of {n}").format(m=self.must_sign_count, k=self.quorum_k, n=self.quorum_n)
+            else:
+                # TRANSLATOR_NOTE: e.g. "2 of 3 keys" -- how many signatures this leaf requires
+                quorum_text = _("{k} of {n} keys").format(k=self.quorum_k, n=self.quorum_n)
             self.components.append(IconTextLine(
                 label_text=_("Requires"),
                 value_text=quorum_text,
@@ -604,16 +617,33 @@ class PSBTSpendPathScreen(ButtonListScreen):
             ))
             screen_y = self.components[-1].screen_y + self.components[-1].height + GUIConstants.COMPONENT_PADDING
 
-        # TRANSLATOR_NOTE: How many of THIS device's own keys can sign this specific leaf
-        eligible_text = ngettext(
-            "{n} of your keys is eligible",
-            "{n} of your keys are eligible",
-            self.num_eligible_keys,
-        ).format(n=self.num_eligible_keys)
-        self.components.append(IconTextLine(
-            label_text=_("Your Keys"),
-            value_text=eligible_text,
-            font_size=20,
+        # What THIS device's key is on this path. On a must-sign path
+        # that is the one thing its holder most needs to see: whether
+        # theirs is the key every spend depends on.
+        yours_color = GUIConstants.BODY_FONT_COLOR
+        mine_must = self.your_must_sign or 0
+        if has_must_sign and mine_must > 0 and mine_must >= self.num_eligible_keys:
+            # TRANSLATOR_NOTE: This device's key is one that every spend on this path requires
+            eligible_text = ngettext("Your key MUST sign", "Your keys MUST sign", self.num_eligible_keys)
+            yours_color = GUIConstants.ACCENT_COLOR
+        elif has_must_sign and mine_must > 0:
+            # TRANSLATOR_NOTE: This device holds both a must-sign key and one of the other keys on this path
+            eligible_text = _("Yours: must-sign + other")
+            yours_color = GUIConstants.ACCENT_COLOR
+        elif has_must_sign:
+            # TRANSLATOR_NOTE: This device's key is one of the non-must-sign keys on this path
+            eligible_text = ngettext("Yours: one of the others", "Yours: among the others", self.num_eligible_keys)
+        else:
+            # TRANSLATOR_NOTE: How many of THIS device's own keys can sign this specific leaf
+            eligible_text = ngettext(
+                "{n} of your keys is eligible",
+                "{n} of your keys are eligible",
+                self.num_eligible_keys,
+            ).format(n=self.num_eligible_keys)
+        self.components.append(TextArea(
+            text=eligible_text,
+            font_size=18,
+            font_color=yours_color,
             screen_y=screen_y,
             is_text_centered=True,
         ))

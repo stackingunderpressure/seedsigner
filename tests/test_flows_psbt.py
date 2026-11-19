@@ -64,6 +64,35 @@ class TestPSBTFlows(FlowTest):
         assert self.controller.psbt_seed is self.controller.storage.seeds[0]
 
 
+    def test_test_network_psbt_on_mainnet_device_warns_then_continues(self):
+        """
+            A psbt signed with test-network keys, on a device set to Mainnet, stops at a
+            warning before the overview (whose addresses would show as bc1), then goes on
+            to the normal review once the user continues. Live finding, 2026-11-19.
+        """
+        def load_psbt_into_decoder(view: scan_views.ScanView):
+            view.decoder.add_data(PSBTTestData.SINGLE_SIG_NATIVE_SEGWIT_2_INPUTS)
+
+        def load_seed_into_decoder(view: scan_views.ScanView):
+            view.decoder.add_data("080115060387063104071857067618681125136207731354")
+
+        self.settings.set_value(SettingsConstants.SETTING__NETWORK, SettingsConstants.MAINNET)
+
+        self.run_sequence([
+            FlowStep(MainMenuView, button_data_selection=MainMenuView.SCAN),
+            FlowStep(scan_views.ScanView, before_run=load_psbt_into_decoder),
+            FlowStep(psbt_views.PSBTSelectSeedView, button_data_selection=psbt_views.PSBTSelectSeedView.SCAN_SEED),
+            FlowStep(scan_views.ScanSeedQRView, before_run=load_seed_into_decoder),
+            FlowStep(seed_views.SeedFinalizeView, button_data_selection=seed_views.SeedFinalizeView.FINALIZE),
+            FlowStep(seed_views.SeedOptionsView, is_redirect=True),
+            FlowStep(psbt_views.PSBTOverviewView, is_redirect=True),
+            FlowStep(psbt_views.PSBTNetworkMismatchWarningView, button_data_selection=0),
+            FlowStep(psbt_views.PSBTOverviewView),
+            FlowStep(psbt_views.PSBTTransactionCheckView),
+        ])
+        assert self.controller.psbt_parser.network_mismatch == "test"
+
+
     def test_tampered_input_amounts_routes_to_input_verification_failed(self):
         """
             A psbt whose non_witness_utxo doesn't verify can declare any input amounts it

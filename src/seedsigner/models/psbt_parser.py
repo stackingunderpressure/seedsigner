@@ -7,7 +7,7 @@ from embit.psbt import PSBT, DerivationPath, InputScope, OutputScope, PSBTError
 from embit.ec import PublicKey
 from embit.util import secp256k1
 from io import BytesIO
-from typing import List
+from typing import List, Optional
 
 from seedsigner.models.seed import Seed
 from seedsigner.models.settings import SettingsConstants
@@ -344,6 +344,10 @@ class PSBTParser():
         self.destination_amounts = []
         self.op_return_data: bytes = None
 
+        # "test" / "main" when the verified signing paths are for a different network
+        # than the device is set to; see detect_network_mismatch().
+        self.network_mismatch: Optional[str] = None
+
         # Whether the fee is high relative to what is being sent; see has_high_fee().
         # Computed once at the end of parse() so the views can read it without each
         # re-walking the outputs.
@@ -549,8 +553,45 @@ class PSBTParser():
 
         # Every total is known now, so settle this once rather than per view.
         self.is_high_fee = self.has_high_fee()
+        self.network_mismatch = self.detect_network_mismatch()
 
         return True
+
+
+    # Purposes whose second path element is the BIP44 coin type (0' = Bitcoin,
+    # 1' = every test network).
+    COIN_TYPE_PURPOSES = (44, 45, 48, 49, 84, 86)
+
+    def detect_network_mismatch(self) -> Optional[str]:
+        """
+        Compares the coin type in the derivation paths this seed was VERIFIED to sign
+        with (never a claimed path) against the device's network setting.
+
+        Returns "test" when the keys are test-network keys (coin type 1') but the
+        device is set to Mainnet, "main" when they are Bitcoin keys (coin type 0') but
+        the device is set to Testnet or Regtest, else None.
+
+        A mismatch changes nothing about the signature -- the seed signs the same
+        bytes either way -- but every address on the review screens is rendered for
+        the device's network, so a signet spend reviewed on a Mainnet-set device shows
+        bc1 addresses that match nothing the coordinator shows. The view warns and
+        lets the user continue (operator decision, 2026-11-19).
+        """
+        coin_types = set()
+        for paths in self.verified_input_derivation_paths:
+            for path_obj in paths:
+                d = path_obj.derivation
+                if len(d) < 2 or d[0] < 0x80000000 or d[1] < 0x80000000:
+                    continue
+                if (d[0] - 0x80000000) not in self.COIN_TYPE_PURPOSES:
+                    continue
+                coin_types.add(d[1] - 0x80000000)
+
+        if self.network == SettingsConstants.MAINNET and 1 in coin_types:
+            return "test"
+        if self.network != SettingsConstants.MAINNET and 0 in coin_types:
+            return "main"
+        return None
 
 
     def _verify_input_amounts_and_scripts(self):

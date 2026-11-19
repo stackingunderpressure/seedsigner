@@ -473,6 +473,40 @@ class TestPSBTParser:
         assert psbt_parser.is_high_fee == psbt_parser.has_high_fee()
 
 
+    def test_network_mismatch(self):
+        """
+            parse() compares the coin type of the VERIFIED signing paths with the
+            device's network setting. The test data signs with test-network keys
+            (m/84'/1'/0'), so a Mainnet-set device must flag it; a Testnet or Regtest
+            one must not. Live finding, 2026-11-19: a Mainnet-set SeedSigner signed a
+            signet spend showing bc1 addresses and no warning.
+        """
+        def parsed(network):
+            psbt = PSBT.parse(a2b_base64(PSBTTestData.SINGLE_SIG_NATIVE_SEGWIT_1_INPUT))
+            psbt.outputs.append(create_output(PSBTTestData.SINGLE_SIG_NATIVE_SEGWIT_RECEIVE, 50_000_000))
+            psbt.outputs.append(create_output(PSBTTestData.SINGLE_SIG_NATIVE_SEGWIT_CHANGE, 49_990_000))
+            return PSBTParser(p=psbt, seed=PSBTTestData.seed, network=network)
+
+        assert parsed(SettingsConstants.REGTEST).network_mismatch is None
+        assert parsed(SettingsConstants.TESTNET).network_mismatch is None
+        assert parsed(SettingsConstants.MAINNET).network_mismatch == "test"
+
+        # The other direction: Bitcoin keys (coin type 0') on a test-network
+        # device. Checked on the comparison itself with a mainnet path.
+        parser = parsed(SettingsConstants.REGTEST)
+        H = 0x80000000
+        mainnet_path = DerivationPath(b"\x00\x00\x00\x01", [84 + H, 0 + H, 0 + H, 0, 0])
+        parser.verified_input_derivation_paths = [[mainnet_path]]
+        assert parser.detect_network_mismatch() == "main"
+        parser.network = SettingsConstants.MAINNET
+        assert parser.detect_network_mismatch() is None
+
+        # Paths with no BIP44-style coin type are never judged.
+        parser.network = SettingsConstants.MAINNET
+        parser.verified_input_derivation_paths = [[DerivationPath(b"\x00\x00\x00\x01", [0, 1])]]
+        assert parser.detect_network_mismatch() is None
+
+
 
 class TestPSBTInputAmountVerification:
     """

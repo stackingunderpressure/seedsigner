@@ -193,6 +193,14 @@ class PSBTOverviewView(View):
             finally:
                 self.loading_screen.stop()
 
+            # Keys for one network, device set to another: say so BEFORE the
+            # overview, whose addresses are rendered for the device's network
+            # and would not match the coordinator's. Shown once per parse --
+            # the parser is cached, so Continue lands on the overview.
+            if self.controller.psbt_parser.network_mismatch:
+                self.set_redirect(Destination(PSBTNetworkMismatchWarningView))
+                return
+
 
     def run(self):
         from seedsigner.gui.screens.psbt_screens import PSBTOverviewScreen
@@ -423,6 +431,37 @@ class PSBTKeyPathSpendView(View):
             return Destination(PSBTSpendPathView)
 
         return PSBTOverviewView._next_destination(psbt_parser)
+
+
+
+class PSBTNetworkMismatchWarningView(View):
+    """
+    The verified signing keys are for a different network than the device is set to.
+    The signature is the same either way; the addresses shown are not. Warn and let
+    the user continue (operator decision, 2026-11-19).
+    """
+    def run(self):
+        if self.controller.psbt_parser.network_mismatch == "test":
+            text = _("This transaction uses test-network keys, but this SeedSigner is set to Mainnet. Addresses will show as bc1 and will not match. To fix, set Settings > Advanced > Bitcoin network to Testnet.")
+        else:
+            text = _("This transaction uses Bitcoin mainnet keys, but this SeedSigner is set to a test network. Addresses will not match. To fix, set Settings > Advanced > Bitcoin network to Mainnet.")
+
+        selected_menu_num = self.run_screen(
+            WarningScreen,
+            # TRANSLATOR_NOTE: The transaction's keys are for a different Bitcoin network than the device's setting
+            status_headline=_("Wrong Network?"),
+            text=text,
+            button_data=[ButtonOption("Continue")],
+        )
+
+        if selected_menu_num == RET_CODE__BACK_BUTTON:
+            self.controller.psbt_seed = None
+            return Destination(BackStackView)
+
+        return Destination(
+            PSBTOverviewView,
+            skip_current_view=True,  # Prevent going BACK to the warning
+        )
 
 
 

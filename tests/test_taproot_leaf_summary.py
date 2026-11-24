@@ -448,9 +448,11 @@ class TestPSBTOverviewRoutingToSpendPathView:
         parser = PSBTParser(psbt, self.seed_a, network=SettingsConstants.REGTEST)
         dest = psbt_views.PSBTOverviewView._next_destination(parser)
         # This PSBT has no change output (single destination-shaped
-        # output in the test builder) -> routes to the no-change warning,
+        # output in the test builder) -> routes to the warnings (stock
+        # SeedSigner's PSBTWarningView, which shows "Full Spend!"),
         # exercising the real branch logic rather than a trivial default.
-        assert dest.View_cls == psbt_views.PSBTNoChangeWarningView
+        assert dest.View_cls == psbt_views.PSBTWarningView
+        assert PSBTParser.WARNING__NO_CHANGE in parser.warnings
 
     def test_legacy_multisig_psbt_is_unaffected_by_the_new_routing(self):
         """A completely ordinary legacy multisig PSBT (no taproot

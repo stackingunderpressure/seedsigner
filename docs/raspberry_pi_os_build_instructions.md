@@ -68,7 +68,7 @@ passwd
 ```
 You will be prompted to enter the current password ("raspberry") and then to enter a new password twice. In our prepared release image, the password used is `AirG@pped!`.
 
-### Install python3.10
+### Install python3.11
 ```bash
 # install compiler dependencies; takes ~1 minute on a Pi Zero 1.3
 # * openssl, libssl-dev: ssl support when pip fetches packages
@@ -77,10 +77,10 @@ sudo apt update && sudo apt install -y build-essential zlib1g-dev \
     libncurses5-dev libgdbm-dev libnss3-dev openssl libssl-dev \
     libreadline-dev libffi-dev wget libsqlite3-dev libraqm-dev
 
-# Grab the python3.10 source
-wget https://www.python.org/ftp/python/3.10.10/Python-3.10.10.tgz
-tar -xzvf Python-3.10.10.tgz
-cd Python-3.10.10
+# Grab the python3.11 source
+wget https://www.python.org/ftp/python/3.11.11/Python-3.11.11.tgz
+tar -xzvf Python-3.11.11.tgz
+cd Python-3.11.11
 
 # Takes ~6 minutes on a Pi Zero 1.3 to check what is available
 ./configure --enable-optimizations
@@ -90,11 +90,11 @@ sudo make altinstall
 
 # cleanup
 cd ..
-sudo rm -rf Python-3.10.10*
+sudo rm -rf Python-3.11.11*
 
-# Make python3.10 the default version
-sudo update-alternatives --install /usr/bin/python python /usr/local/bin/python3.10 1
-sudo update-alternatives --install /usr/bin/python3 python3 /usr/local/bin/python3.10 1
+# Make python3.11 the default version
+sudo update-alternatives --install /usr/bin/python python /usr/local/bin/python3.11 1
+sudo update-alternatives --install /usr/bin/python3 python3 /usr/local/bin/python3.11 1
 ```
 
 Manually re-install `python3-apt` to avoid error messages in later steps (though, ironically, you will see the "ModuleNotFoundError: No module named 'apt_pkg'" error message during the `apt remove` step):

@@ -32,9 +32,9 @@ jobs:
     timeout-minutes: 20
     strategy:
       matrix:
-        # 3.10: currently used by Seedsigner
+        # 3.11: the minimum since Pillow 13 (2026-11-27; Pillow 13 needs >=3.11)
         # 3.12: latest stable Python as upper test bound
-        python-version: ["3.10", "3.12"]
+        python-version: ["3.11", "3.12"]
 
     steps:
       - uses: actions/checkout@v4

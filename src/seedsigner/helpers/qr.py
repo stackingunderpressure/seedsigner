@@ -2,6 +2,7 @@ import qrcode
 from qrcode.image.styledpil import StyledPilImage
 from qrcode.image.styles.moduledrawers import CircleModuleDrawer, GappedSquareModuleDrawer
 from PIL import Image, ImageDraw
+import re
 import subprocess
 
 class QR:
@@ -96,8 +97,18 @@ class QR:
         else:
             border_str = "3"
 
-        cmd = f"""qrencode -m {border_str} -s 3 -l L --foreground=000000 --background={background_color} -t PNG -o "/tmp/qrcode.png" "{str(data)}" """
-        rv = subprocess.call(cmd, shell=True)
+        # A colour is six hex digits; anything else gets the default.
+        if not (isinstance(background_color, str) and re.fullmatch(r"[0-9A-Fa-f]{6}", background_color)):
+            background_color = "808080"
+
+        # An argument list, never a shell string: the QR data is one argument
+        # and can't become a command (outside review, 2026-11-27).
+        cmd = ["qrencode", "-m", border_str, "-s", "3", "-l", "L", "--foreground=000000",
+               f"--background={background_color}", "-t", "PNG", "-o", "/tmp/qrcode.png", str(data)]
+        try:
+            rv = subprocess.call(cmd)
+        except OSError:
+            rv = 1  # qrencode not installed
 
         # if qrencode fails, fall back to only encoder
         if rv != 0:

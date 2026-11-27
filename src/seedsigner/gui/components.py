@@ -281,7 +281,9 @@ class Fonts(Singleton):
             captured_exception = None
             for font_path in cls.font_paths:
                 try:
-                    cls.fonts[font_name][size] = ImageFont.truetype(os.path.join(font_path, f"{font_name}.{file_extension}"), size)
+                    font = ImageFont.truetype(os.path.join(font_path, f"{font_name}.{file_extension}"), size)
+                    font.__class__ = _LineBreakSafeFont
+                    cls.fonts[font_name][size] = font
                     break
                 except OSError as e:
                     captured_exception = e
@@ -295,6 +297,23 @@ class Fonts(Singleton):
                     raise captured_exception
 
         return cls.fonts[font_name][size]
+
+
+
+class _LineBreakSafeFont(ImageFont.FreeTypeFont):
+    """
+    Pillow 13's text layout refuses to measure a line break in one getbbox()
+    call (RuntimeError: raqm_layout() failed); Pillow 10.3 measured it as a
+    missing-glyph box. Several screens measure whole multi-line strings
+    (the sign-message reflow, toasts), so measure a line break exactly as 10.3
+    did: as a character the font doesn't have. Checked against Pillow 10.3:
+    identical results for multi-line strings at sizes 17, 18, 20 and 26.
+    Only measuring changes; drawing is untouched.
+    """
+    def getbbox(self, text, *args, **kwargs):
+        if isinstance(text, str) and "\n" in text:
+            text = text.replace("\n", "\uffff")
+        return super().getbbox(text, *args, **kwargs)
 
 
 

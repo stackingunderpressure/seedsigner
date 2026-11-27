@@ -113,6 +113,10 @@ class PSBTOverviewView(View):
                     seed=self.controller.psbt_seed,
                     network=self.settings.get_value(SettingsConstants.SETTING__NETWORK)
                 )
+                # Outside review 2026-11-27: change that sits in a script tree can
+                # only be trusted against a registered descriptor. Without one it is
+                # counted as money leaving (PSBTParser.settle_unverified_script_tree_change).
+                self.controller.psbt_parser.settle_unverified_script_tree_change(self.controller.multisig_wallet_descriptor)
 
             # Note that in almost every exception case, we set clear_history to disable
             # returning via BACK button in the Destination.

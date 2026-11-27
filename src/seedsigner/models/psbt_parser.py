@@ -365,7 +365,11 @@ class PSBTParser():
 
     # The maximum difference allowed between a change output's address index and the
     # smallest address index of the relevant inputs being spent.
-    CHANGE_ADDRESS_INDEX_WINDOW = 10_000
+    # This fork (DynastyTrust): 1,000, not stock's 10,000 -- outside review
+    # 2026-11-27. DynastyTrust refuses change past address 999 and its Bitcoin Core
+    # recovery steps import addresses 0-999, so change further out than that is change
+    # a restore by those steps would never find.
+    CHANGE_ADDRESS_INDEX_WINDOW = 1_000
 
     # The non-fatal findings that can be recorded in self.warnings
     WARNING__HIGH_FEE = "high_fee"
@@ -2497,6 +2501,34 @@ class PSBTParser():
         branch (1).
         """
         return len(derivation_path) >= 2 and derivation_path[-2] == 1
+
+
+    def settle_unverified_script_tree_change(self, descriptor: Optional[Descriptor]) -> None:
+        """
+        Outside review, 2026-11-27: an output whose tap tree holds one of this seed's
+        keys was counted as presumed change with no descriptor to confirm it. A tree
+        like tr(NUMS,{pk(you), pk(attacker)}) qualifies, and the attacker can spend it
+        alone, so money leaving was shown as coming back.
+
+        Called by the PSBT views right after parsing. With no registered descriptor,
+        every such output is moved from change to money leaving -- the user sees its
+        address and amount as a spend. With a descriptor, the outputs stay as change
+        and are verified against it in PSBTChangeDetailsView (a mismatch refuses the
+        psbt). Idempotent.
+        """
+        if descriptor is not None or getattr(self, "_script_tree_change_settled", False):
+            return
+        self._script_tree_change_settled = True
+        kept = []
+        for change in self.change_data:
+            if change.get("is_taproot_script_path"):
+                self.destination_addresses.append(change["address"])
+                self.destination_amounts.append(change["amount"])
+                self.spend_amount += change["amount"]
+                self.change_amount -= change["amount"]
+            else:
+                kept.append(change)
+        self.change_data = kept
 
 
     def verify_multisig_output(self, descriptor: Descriptor, change_num: int) -> bool:
